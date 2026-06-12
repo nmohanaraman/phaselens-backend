@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: phaselens-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: ADMIN_EMAIL
+        value: nmohanaraman@gmail.com
+      - key: ADMIN_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
