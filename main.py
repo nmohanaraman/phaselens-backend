@@ -210,32 +210,27 @@ def fetch_stock(ticker: str) -> dict:
                         return round(float(v) * (100 if pct else 1), 2)
                 return None
 
+            # Field names confirmed from live FMP debug endpoint response
             data = {
                 "ticker":           t,
                 "name":             q.get("name") or t,
                 "price":            price,
                 "pe_ratio":         pick(
-                                      (km, "peRatioTTM"),
-                                      (r,  "peRatioTTM"),
-                                      (km, "priceEarningsRatioTTM"),
+                                      (r,  "priceToEarningsRatioTTM"),   # confirmed in ratios_ttm
                                     ),
                 "fcf_yield":        pick(
-                                      (km, "freeCashFlowYieldTTM"),
-                                      (km, "fcfYieldTTM"),
-                                      (r,  "freeCashFlowYieldTTM"),
+                                      (km, "freeCashFlowYieldTTM"),       # confirmed in key_metrics_ttm
                                       pct=True,
                                     ),
-                "gross_margin":     pick((r, "grossProfitMarginTTM"),
-                                        (km,"grossProfitMarginTTM"), pct=True),
-                "operating_margin": pick((r, "operatingProfitMarginTTM"),
-                                        (km,"operatingProfitMarginTTM"), pct=True),
+                "gross_margin":     pick((r, "grossProfitMarginTTM"),     # confirmed
+                                        pct=True),
+                "operating_margin": pick((r, "operatingProfitMarginTTM"), # confirmed
+                                        pct=True),
                 "revenue_growth":   rev_growth,
-                "dividend_yield":   pick((r,  "dividendYieldTTM"),
-                                        (km, "dividendYieldTTM"),
-                                        (q,  "dividendYield"), pct=True),
-                "debt_to_equity":   pick((r,  "debtEquityRatioTTM"),
-                                        (km, "debtToEquityTTM"),
-                                        (r,  "totalDebtToEquityTTM")),
+                "dividend_yield":   pick((r, "dividendYieldTTM"),         # confirmed: 0.00360664
+                                        pct=True),
+                "debt_to_equity":   pick((r, "debtToEquityRatioTTM"),    # confirmed in ratios_ttm
+                                    ),
                 "market_cap":       mc,
             }
         except HTTPException:
@@ -458,26 +453,6 @@ def api_track(body: TrackIn):
                   (body.visitor_id[:64], (body.email or "")[:120], body.event[:64],
                    (body.ticker or "")[:12], now_iso()))
     return {"ok": True}
-
-# ─────────────────────────── Debug (remove after field names confirmed) ───────
-@app.get("/api/debug/{ticker}")
-def api_debug(ticker: str):
-    """Dump raw FMP field names — open in browser to see exact keys. Delete once done."""
-    if not FMP_API_KEY:
-        raise HTTPException(503, "FMP_API_KEY not set")
-    t = ticker.upper().strip()
-    result = {}
-    for name, path in [
-        ("key_metrics_ttm", f"key-metrics-ttm?symbol={t}"),
-        ("ratios_ttm",      f"ratios-ttm?symbol={t}"),
-        ("quote",           f"quote?symbol={t}"),
-    ]:
-        try:
-            raw = _fmp_get(path)
-            result[name] = raw[0] if raw and isinstance(raw, list) else raw
-        except Exception as e:
-            result[name] = {"error": str(e)}
-    return result
 
 # ─────────────────────────── Admin (key OR signed-in admin email) ───────────
 def check_admin(key: str | None, authorization: str | None):
