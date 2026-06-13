@@ -167,19 +167,23 @@ def fetch_stock(ticker: str) -> dict:
     if MOCK:
         data = dict(MOCK_DATA, ticker=t, name=f"{t} Inc (mock)")
     elif FMP_API_KEY:
-        # ── Financial Modeling Prep (primary — reliable on cloud servers) ──
+        # ── Financial Modeling Prep — FREE tier endpoints only ──
+        # /profile      → price, marketCap, companyName  (FREE)
+        # /ratios-ttm   → PE, margins, FCF yield         (FREE)
+        # /income-statement → revenue history            (FREE)
+        # NOTE: /quote and /key-metrics-ttm are PAID — do not use them
         try:
-            # Quote endpoint: real-time price + basic info
-            quotes = _fmp_get(f"quote/{t}?")
-            if not quotes or not isinstance(quotes, list):
-                raise HTTPException(503, f"No data returned for {t} — check the ticker symbol")
-            q = quotes[0]
+            # Profile: price + name + market cap
+            profile_raw = _fmp_get(f"profile/{t}?")
+            if not profile_raw or not isinstance(profile_raw, list):
+                raise HTTPException(503, f"No data for {t} — verify the ticker exists on FMP")
+            p = profile_raw[0]
 
-            # Key metrics endpoint: FCF yield, PE, margins
-            metrics_raw = _fmp_get(f"key-metrics-ttm/{t}?limit=1")
-            m = metrics_raw[0] if metrics_raw and isinstance(metrics_raw, list) else {}
+            # Ratios TTM: PE, margins, FCF yield, debt/equity, dividend yield
+            ratios_raw = _fmp_get(f"ratios-ttm/{t}?")
+            r = ratios_raw[0] if ratios_raw and isinstance(ratios_raw, list) else {}
 
-            # Income statement: revenue growth
+            # Income statement: 2 years to compute revenue growth
             income_raw = _fmp_get(f"income-statement/{t}?limit=2&period=annual")
             rev_growth = None
             if income_raw and len(income_raw) >= 2:
@@ -187,27 +191,25 @@ def fetch_stock(ticker: str) -> dict:
                 r_old = income_raw[1].get("revenue") or 1
                 rev_growth = round((r_new - r_old) / abs(r_old) * 100, 1) if r_old else None
 
-            mc  = q.get("marketCap") or 0
-            fcf = m.get("freeCashFlowPerShareTTM", 0) or 0
-            shares = q.get("sharesOutstanding") or 0
-            fcf_total = fcf * shares
-            fcf_yield = round(fcf_total / mc * 100, 2) if mc else None
+            price = p.get("price")
+            mc    = p.get("mktCap") or 0
+
+            if not price:
+                raise HTTPException(503, f"No price returned for {t} — check ticker symbol")
 
             data = {
-                "ticker": t,
-                "name":              q.get("name") or t,
-                "price":             q.get("price"),
-                "pe_ratio":          q.get("pe"),
-                "fcf_yield":         fcf_yield,
-                "gross_margin":      round((m.get("grossProfitMarginTTM") or 0) * 100, 1),
-                "operating_margin":  round((m.get("operatingProfitMarginTTM") or 0) * 100, 1),
-                "revenue_growth":    rev_growth,
-                "dividend_yield":    round((q.get("dividendYield") or 0) * 100, 2),
-                "debt_to_equity":    round(m.get("debtToEquityTTM") or 0, 2) or None,
-                "market_cap":        mc,
+                "ticker":           t,
+                "name":             p.get("companyName") or t,
+                "price":            price,
+                "pe_ratio":         r.get("peRatioTTM"),
+                "fcf_yield":        round((r.get("freeCashFlowYieldTTM") or 0) * 100, 2) or None,
+                "gross_margin":     round((r.get("grossProfitMarginTTM") or 0) * 100, 1),
+                "operating_margin": round((r.get("operatingProfitMarginTTM") or 0) * 100, 1),
+                "revenue_growth":   rev_growth,
+                "dividend_yield":   round((r.get("dividendYieldTTM") or 0) * 100, 2),
+                "debt_to_equity":   round(r.get("debtEquityRatioTTM") or 0, 2) or None,
+                "market_cap":       mc,
             }
-            if not data["price"]:
-                raise HTTPException(503, f"No price returned for {t}")
         except HTTPException:
             raise
         except Exception as exc:
