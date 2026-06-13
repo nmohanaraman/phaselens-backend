@@ -459,6 +459,26 @@ def api_track(body: TrackIn):
                    (body.ticker or "")[:12], now_iso()))
     return {"ok": True}
 
+# ─────────────────────────── Debug (remove after field names confirmed) ───────
+@app.get("/api/debug/{ticker}")
+def api_debug(ticker: str):
+    """Dump raw FMP field names — open in browser to see exact keys. Delete once done."""
+    if not FMP_API_KEY:
+        raise HTTPException(503, "FMP_API_KEY not set")
+    t = ticker.upper().strip()
+    result = {}
+    for name, path in [
+        ("key_metrics_ttm", f"key-metrics-ttm?symbol={t}"),
+        ("ratios_ttm",      f"ratios-ttm?symbol={t}"),
+        ("quote",           f"quote?symbol={t}"),
+    ]:
+        try:
+            raw = _fmp_get(path)
+            result[name] = raw[0] if raw and isinstance(raw, list) else raw
+        except Exception as e:
+            result[name] = {"error": str(e)}
+    return result
+
 # ─────────────────────────── Admin (key OR signed-in admin email) ───────────
 def check_admin(key: str | None, authorization: str | None):
     if ADMIN_KEY and key == ADMIN_KEY:
