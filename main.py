@@ -167,22 +167,27 @@ def fetch_stock(ticker: str) -> dict:
     if MOCK:
         data = dict(MOCK_DATA, ticker=t, name=f"{t} Inc (mock)")
     elif FMP_API_KEY:
-        # ── Financial Modeling Prep — /stable/ endpoints (your free key works here) ──
-        # /stable/quote              → price, marketCap, name, PE, volume
-        # /stable/ratios-ttm         → margins, FCF yield, debt/equity
+        # ── Financial Modeling Prep — /stable/ endpoints ──
+        # /stable/quote              → price, marketCap, name
+        # /stable/ratios-ttm         → margins, debt/equity, dividend yield
+        # /stable/key-metrics-ttm    → PE ratio, FCF yield (most reliable source)
         # /stable/income-statement   → revenue history for growth calc
         try:
-            # Quote: real-time price + core fields
+            # 1. Quote: real-time price + name + market cap
             quote_raw = _fmp_get(f"quote?symbol={t}")
             if not quote_raw or not isinstance(quote_raw, list):
                 raise HTTPException(503, f"No data for {t} — verify the ticker symbol")
             q = quote_raw[0]
 
-            # Ratios TTM: margins, FCF yield, debt/equity, dividend yield
+            # 2. Key metrics TTM: PE ratio + FCF yield (most reliable FMP source)
+            km_raw = _fmp_get(f"key-metrics-ttm?symbol={t}")
+            km = km_raw[0] if km_raw and isinstance(km_raw, list) else {}
+
+            # 3. Ratios TTM: margins + debt/equity + dividend yield
             ratios_raw = _fmp_get(f"ratios-ttm?symbol={t}")
             r = ratios_raw[0] if ratios_raw and isinstance(ratios_raw, list) else {}
 
-            # Income statement: 2 years for revenue growth
+            # 4. Income statement: 2 years for revenue growth
             income_raw = _fmp_get(f"income-statement?symbol={t}&limit=2&period=annual")
             rev_growth = None
             if income_raw and len(income_raw) >= 2:
@@ -196,32 +201,41 @@ def fetch_stock(ticker: str) -> dict:
             if not price:
                 raise HTTPException(503, f"No price returned for {t} — check ticker symbol")
 
-            # Helper: get a ratio field trying multiple common FMP field name variants
-            def ratio(primary, *fallbacks, pct=False, scale=1):
-                for key in (primary,) + fallbacks:
-                    v = r.get(key)
-                    if v is None: v = q.get(key)   # also check quote object
+            # Helper: first non-null non-zero value across multiple sources + field names
+            def pick(*pairs, pct=False):
+                """pairs = (obj, fieldname) tuples in priority order"""
+                for obj, key in pairs:
+                    v = obj.get(key)
                     if v is not None and v != 0:
-                        return round(float(v) * (100 if pct else 1) * scale, 2)
+                        return round(float(v) * (100 if pct else 1), 2)
                 return None
 
             data = {
                 "ticker":           t,
                 "name":             q.get("name") or t,
                 "price":            price,
-                # PE: quote has it directly; ratios has peRatioTTM
-                "pe_ratio":         ratio("peRatioTTM", "pe", "priceEarningsRatioTTM"),
-                # FCF yield: try multiple field name variants FMP uses
-                "fcf_yield":        ratio("freeCashFlowYieldTTM", "freeCashflowYieldTTM",
-                                          "fcfYieldTTM", pct=True),
-                "gross_margin":     round((r.get("grossProfitMarginTTM") or 0) * 100, 1) or None,
-                "operating_margin": round((r.get("operatingProfitMarginTTM") or 0) * 100, 1) or None,
+                "pe_ratio":         pick(
+                                      (km, "peRatioTTM"),
+                                      (r,  "peRatioTTM"),
+                                      (km, "priceEarningsRatioTTM"),
+                                    ),
+                "fcf_yield":        pick(
+                                      (km, "freeCashFlowYieldTTM"),
+                                      (km, "fcfYieldTTM"),
+                                      (r,  "freeCashFlowYieldTTM"),
+                                      pct=True,
+                                    ),
+                "gross_margin":     pick((r, "grossProfitMarginTTM"),
+                                        (km,"grossProfitMarginTTM"), pct=True),
+                "operating_margin": pick((r, "operatingProfitMarginTTM"),
+                                        (km,"operatingProfitMarginTTM"), pct=True),
                 "revenue_growth":   rev_growth,
-                # Dividend yield: quote has raw decimal, ratios has TTM version
-                "dividend_yield":   ratio("dividendYieldTTM", "dividendYield", pct=True),
-                # Debt/equity: ratios field OR compute from quote if available
-                "debt_to_equity":   ratio("debtEquityRatioTTM", "debtToEquityRatioTTM",
-                                          "totalDebtToEquityTTM"),
+                "dividend_yield":   pick((r,  "dividendYieldTTM"),
+                                        (km, "dividendYieldTTM"),
+                                        (q,  "dividendYield"), pct=True),
+                "debt_to_equity":   pick((r,  "debtEquityRatioTTM"),
+                                        (km, "debtToEquityTTM"),
+                                        (r,  "totalDebtToEquityTTM")),
                 "market_cap":       mc,
             }
         except HTTPException:
