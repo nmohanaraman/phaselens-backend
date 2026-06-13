@@ -84,6 +84,18 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS terms(
             visitor_id TEXT PRIMARY KEY, email TEXT,
             agreed_at TEXT, ip_hash TEXT)""")
+        # analyses table — stores every verdict result for admin dashboard
+        c.execute("""CREATE TABLE IF NOT EXISTS analyses(
+            id INTEGER PRIMARY KEY """ + ("GENERATED ALWAYS AS IDENTITY" if IS_PG else "AUTOINCREMENT") + """,
+            visitor_id TEXT, email TEXT, ticker TEXT,
+            verdict TEXT, recommendation TEXT, score INTEGER,
+            phase TEXT, buffett_score INTEGER, dilution_status TEXT,
+            runway_status TEXT, stage TEXT, created_at TEXT)""" if not IS_PG else
+            """CREATE TABLE IF NOT EXISTS analyses(
+            id SERIAL PRIMARY KEY, visitor_id TEXT, email TEXT, ticker TEXT,
+            verdict TEXT, recommendation TEXT, score INTEGER,
+            phase TEXT, buffett_score INTEGER, dilution_status TEXT,
+            runway_status TEXT, stage TEXT, created_at TEXT)""")
         # Migrate: add terms_agreed_at to accounts if missing
         try:
             c.execute("ALTER TABLE accounts ADD COLUMN terms_agreed_at TEXT")
@@ -977,7 +989,7 @@ def api_stock(ticker: str):
     return fetch_stock(ticker)
 
 @app.get("/api/analyze/{ticker}")
-def api_analyze(ticker: str):
+def api_analyze(ticker: str, visitor_id: str = "", email: str = ""):
     t = ticker.upper().strip()
     hit = _analysis_cache.get(t)
     if hit and hit[0] > time.time():
@@ -1012,6 +1024,24 @@ def api_analyze(ticker: str):
         "generated_at": now_iso(),
     }
     _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)
+    # Auto-log verdict to analyses table for admin dashboard
+    try:
+        fc    = forensics.get("checks", {})
+        bs    = fc.get("buffett_score", {}).get("pass")
+        dil_s = fc.get("dilution", {}).get("status")
+        run_s = fc.get("runway", {}).get("status")
+        stg   = fc.get("stage", {}).get("current_node")
+        vrd   = payload.get("verdictCard", {}).get("section1", {}).get("classification")
+        with db() as conn:
+            c = conn.cursor()
+            c.execute(q("INSERT INTO analyses(visitor_id,email,ticker,verdict,recommendation,"
+                        "score,phase,buffett_score,dilution_status,runway_status,stage,created_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"),
+                      (visitor_id[:64] if visitor_id else "", email[:120] if email else "", t, vrd or "", sig.get("recommendation",""),
+                       sig.get("score",0), ph.get("phase",""),
+                       bs, dil_s or "", run_s or "", stg or "", now_iso()))
+    except Exception:
+        pass   # never let DB write break the API response
     return payload
 
 # ─────────────────────────── Terms agreement ────────────────────────────────
@@ -1110,7 +1140,8 @@ def admin_summary(key: str | None = Query(None),
         c.execute("SELECT COUNT(DISTINCT visitor_id) FROM events"); visitors = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM accounts"); n_accounts = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM events"); total_events = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM events WHERE event LIKE 'analyze%'"); analyses = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM analyses"); analyses = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT visitor_id) FROM analyses WHERE visitor_id<>''"); unique_analyzers = c.fetchone()[0]
         c.execute("""SELECT ticker, COUNT(*) n FROM events
                      WHERE ticker<>'' GROUP BY ticker ORDER BY n DESC LIMIT 8""")
         top_tickers = [{"ticker": r[0], "count": r[1]} for r in c.fetchall()]
@@ -1126,8 +1157,39 @@ def admin_summary(key: str | None = Query(None),
                      ORDER BY id DESC LIMIT 50""")
         events = [{"visitor_id": r[0], "email": r[1] or "", "event": r[2],
                    "ticker": r[3] or "", "at": r[4]} for r in c.fetchall()]
+        # Verdict breakdown
+        c.execute("""SELECT verdict, COUNT(*) n FROM analyses
+                     WHERE verdict<>'' GROUP BY verdict ORDER BY n DESC""")
+        verdict_breakdown = [{"verdict": r[0], "count": r[1]} for r in c.fetchall()]
+
+        # Recent analyses with full verdict data
+        c.execute("""SELECT visitor_id, email, ticker, verdict, recommendation,
+                            score, phase, buffett_score, dilution_status,
+                            runway_status, stage, created_at
+                     FROM analyses ORDER BY id DESC LIMIT 100""")
+        recent_analyses = [{
+            "visitor_id": r[0], "email": r[1] or "(anonymous)",
+            "ticker": r[2], "verdict": r[3], "recommendation": r[4],
+            "score": r[5], "phase": r[6], "buffett_score": r[7],
+            "dilution_status": r[8], "runway_status": r[9],
+            "stage": r[10], "at": r[11],
+        } for r in c.fetchall()]
+
+        # Top tickers by verdict — what % of analyses were traps?
+        c.execute("""SELECT ticker,
+                            SUM(CASE WHEN verdict='VALUE TRAP' THEN 1 ELSE 0 END) traps,
+                            SUM(CASE WHEN verdict='VALUE STOCK' THEN 1 ELSE 0 END) stocks,
+                            COUNT(*) total
+                     FROM analyses WHERE ticker<>''
+                     GROUP BY ticker ORDER BY total DESC LIMIT 10""")
+        ticker_verdicts = [{"ticker":r[0],"traps":r[1],"stocks":r[2],"total":r[3]}
+                           for r in c.fetchall()]
+
     return {"visitors": visitors, "accounts": n_accounts,
-            "total_events": total_events, "analyses": analyses,
+            "total_events": total_events, "analyses": analyses, "unique_analyzers": unique_analyzers,
             "top_tickers": top_tickers, "daily": daily,
+            "verdict_breakdown": verdict_breakdown,
+            "recent_analyses": recent_analyses,
+            "ticker_verdicts": ticker_verdicts,
             "account_list": accounts, "recent_events": events,
             "admin_email": ADMIN_EMAIL}
