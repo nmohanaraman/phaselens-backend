@@ -150,29 +150,62 @@ def fetch_stock(ticker: str) -> dict:
     if MOCK:
         data = dict(MOCK_DATA, ticker=t, name=f"{t} Inc (mock)")
     else:
-        try:
-            import yfinance as yf
-            info = yf.Ticker(t).info
-            mc  = info.get("marketCap") or 0
-            fcf = info.get("freeCashflow") or 0
-            de_raw = info.get("debtToEquity")
-            data = {
-                "ticker": t,
-                "name": info.get("longName") or info.get("shortName") or t,
-                "price": info.get("currentPrice") or info.get("regularMarketPrice"),
-                "pe_ratio": info.get("trailingPE"),
-                "fcf_yield": round(fcf / mc * 100, 2) if mc else None,
-                "gross_margin": round((info.get("grossMargins") or 0) * 100, 1),
-                "operating_margin": round((info.get("operatingMargins") or 0) * 100, 1),
-                "revenue_growth": round((info.get("revenueGrowth") or 0) * 100, 1),
-                "dividend_yield": round((info.get("dividendYield") or 0) * 100, 2),
-                "debt_to_equity": round(de_raw / 100, 2) if de_raw else None,
-                "market_cap": mc,
-            }
-            if data["price"] is None:
-                raise ValueError("no price")
-        except Exception as exc:
-            raise HTTPException(503, f"Market data unavailable for {t}: {exc}")
+        import yfinance as yf
+        import requests as _req
+
+        # Real browser User-Agent — Yahoo is more lenient with these
+        session = _req.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        })
+
+        last_exc = None
+        info = {}
+        for attempt in range(3):
+            try:
+                tk = yf.Ticker(t, session=session)
+                info = tk.info
+                # yfinance returns a minimal dict when rate-limited — check for price
+                if not info.get("regularMarketPrice") and not info.get("currentPrice"):
+                    fi = tk.fast_info
+                    price_fb = getattr(fi, "last_price", None)
+                    if price_fb:
+                        info["currentPrice"] = price_fb
+                if info.get("currentPrice") or info.get("regularMarketPrice"):
+                    break
+                time.sleep(2 ** attempt)
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(2 ** attempt)
+
+        mc     = info.get("marketCap") or 0
+        fcf    = info.get("freeCashflow") or 0
+        de_raw = info.get("debtToEquity")
+        price  = info.get("currentPrice") or info.get("regularMarketPrice")
+
+        if not price:
+            msg = str(last_exc) if last_exc else "Yahoo Finance returned no price after 3 attempts"
+            raise HTTPException(503, f"Market data unavailable for {t}: {msg}")
+
+        data = {
+            "ticker": t,
+            "name": info.get("longName") or info.get("shortName") or t,
+            "price": price,
+            "pe_ratio": info.get("trailingPE"),
+            "fcf_yield": round(fcf / mc * 100, 2) if mc else None,
+            "gross_margin": round((info.get("grossMargins") or 0) * 100, 1),
+            "operating_margin": round((info.get("operatingMargins") or 0) * 100, 1),
+            "revenue_growth": round((info.get("revenueGrowth") or 0) * 100, 1),
+            "dividend_yield": round((info.get("dividendYield") or 0) * 100, 2),
+            "debt_to_equity": round(de_raw / 100, 2) if de_raw else None,
+            "market_cap": mc,
+        }
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
