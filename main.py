@@ -81,6 +81,14 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS accounts(
             uid TEXT PRIMARY KEY, email TEXT, name TEXT, provider TEXT,
             first_seen TEXT, last_seen TEXT, sign_ins INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS terms(
+            visitor_id TEXT PRIMARY KEY, email TEXT,
+            agreed_at TEXT, ip_hash TEXT)""")
+        # Migrate: add terms_agreed_at to accounts if missing
+        try:
+            c.execute("ALTER TABLE accounts ADD COLUMN terms_agreed_at TEXT")
+        except Exception:
+            pass
 init_db()
 
 def now_iso():
@@ -187,13 +195,19 @@ def fetch_stock(ticker: str) -> dict:
             ratios_raw = _fmp_get(f"ratios-ttm?symbol={t}")
             r = ratios_raw[0] if ratios_raw and isinstance(ratios_raw, list) else {}
 
-            # 4. Income statement: 2 years for revenue growth
-            income_raw = _fmp_get(f"income-statement?symbol={t}&limit=2&period=annual")
+            # 4. Income statement: 4 years for revenue growth + EPS predictability
+            income_raw = _fmp_get(f"income-statement?symbol={t}&limit=4&period=annual")
             rev_growth = None
+            eps_history = []   # list of EPS values newest→oldest, for predictability check
             if income_raw and len(income_raw) >= 2:
                 r_new = income_raw[0].get("revenue") or 0
                 r_old = income_raw[1].get("revenue") or 1
                 rev_growth = round((r_new - r_old) / abs(r_old) * 100, 1) if r_old else None
+                # Collect EPS for up to 4 years
+                for yr in income_raw:
+                    eps_val = yr.get("eps") or yr.get("epsdiluted")
+                    if eps_val is not None:
+                        eps_history.append(eps_val)
 
             price = q.get("price")
             mc    = q.get("marketCap") or 0
@@ -232,6 +246,9 @@ def fetch_stock(ticker: str) -> dict:
                 "debt_to_equity":   pick((r, "debtToEquityRatioTTM"),    # confirmed in ratios_ttm
                                     ),
                 "market_cap":       mc,
+                # Extra fields for forensic analysis
+                "roic":             pick((km, "returnOnInvestedCapitalTTM"), pct=True),
+                "eps_history":      eps_history,   # newest→oldest, up to 4yr
             }
         except HTTPException:
             raise
@@ -266,6 +283,235 @@ def fetch_stock(ticker: str) -> dict:
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
+# ─────────────────────────── Deep data (balance sheet + cash flow) ─────────
+def fetch_deep_data(ticker: str) -> dict:
+    """Fetch balance sheet + cash flow statement for forensic analysis.
+    Only called from /api/analyze — adds 2 FMP calls per ticker."""
+    t = ticker.upper().strip()
+    if MOCK:
+        return {
+            "cash": 50_000_000_000, "total_debt": 40_000_000_000,
+            "total_equity": 80_000_000_000, "retained_earnings": 60_000_000_000,
+            "retained_earnings_prior": 55_000_000_000,
+            "preferred_stock": 0, "treasury_stock": -20_000_000_000,
+            "shares_outstanding": 15_000_000_000, "shares_outstanding_prior": 15_500_000_000,
+            "net_share_issuance": -3_000_000_000, "net_share_issuance_prior": -2_500_000_000,
+            "fcf": 100_000_000_000, "fcf_prior": 90_000_000_000,
+            "operating_income": 30_000_000_000,
+        }
+    if not FMP_API_KEY:
+        return {}
+    result = {}
+    try:
+        # Balance sheet: 2 years for trend comparison
+        bs_raw = _fmp_get(f"balance-sheet-statement?symbol={t}&limit=2&period=annual")
+        if bs_raw and isinstance(bs_raw, list) and bs_raw:
+            bs = bs_raw[0]
+            bs_prior = bs_raw[1] if len(bs_raw) >= 2 else {}
+            result["cash"]              = (bs.get("cashAndCashEquivalents") or 0) + (bs.get("shortTermInvestments") or 0)
+            result["total_debt"]        = bs.get("totalDebt") or bs.get("longTermDebt") or 0
+            result["total_equity"]      = bs.get("totalStockholdersEquity") or 0
+            result["retained_earnings"] = bs.get("retainedEarnings") or 0
+            result["retained_earnings_prior"] = bs_prior.get("retainedEarnings") or 0
+            result["preferred_stock"]   = bs.get("preferredStock") or 0
+            result["treasury_stock"]    = bs.get("totalTreasuryStock") or bs.get("treasuryStock") or 0
+            result["shares_outstanding"] = bs.get("commonStockSharesOutstanding") or bs.get("sharesOutstanding") or 0
+            result["shares_outstanding_prior"] = bs_prior.get("commonStockSharesOutstanding") or bs_prior.get("sharesOutstanding") or 0
+
+        # Cash flow statement: 2 years for dilution trend
+        cf_raw = _fmp_get(f"cash-flow-statement?symbol={t}&limit=2&period=annual")
+        if cf_raw and isinstance(cf_raw, list) and cf_raw:
+            cf = cf_raw[0]
+            cf_prior = cf_raw[1] if len(cf_raw) >= 2 else {}
+            result["net_share_issuance"] = (cf.get("commonStockIssued") or 0) - abs(cf.get("commonStockRepurchased") or 0)
+            result["net_share_issuance_prior"] = (cf_prior.get("commonStockIssued") or 0) - abs(cf_prior.get("commonStockRepurchased") or 0)
+            result["fcf"]       = cf.get("freeCashFlow") or 0
+            result["fcf_prior"] = cf_prior.get("freeCashFlow") or 0
+            result["operating_income"] = cf.get("operatingIncome") or 0
+    except Exception:
+        pass  # deep data is optional — analysis still works without it
+    return result
+
+
+# ─────────────────────────── Forensic analysis engine ─────────────────────
+def _status(val, g_thresh, y_thresh, invert=False):
+    """Map a numeric value to green/yellow/red. invert=True: lower is better."""
+    if val is None: return "gray"
+    if not invert:
+        if val >= g_thresh: return "green"
+        if val >= y_thresh: return "yellow"
+        return "red"
+    else:
+        if val <= g_thresh: return "green"
+        if val <= y_thresh: return "yellow"
+        return "red"
+
+def compute_forensics(m: dict, deep: dict) -> dict:
+    """
+    Spec-compliant forensics. Every metric returned as:
+      {value: str, status: green|yellow|red|gray, label: str}
+    Structured exactly as the frontend mapping spec requires.
+    """
+    checks  = {}
+    drivers = []
+
+    # ── 1. BUFFETT CHECKS ─────────────────────────────────────────────
+    roic     = m.get("roic")             # % already
+    gm       = m.get("gross_margin")     # %
+    de       = m.get("debt_to_equity")   # ratio
+    fcf_y    = m.get("fcf_yield")        # %
+    eps_hist = m.get("eps_history", [])  # newest→oldest
+
+    # ROIC
+    roic_s = _status(roic, 10, 5)
+    checks["roic"] = {
+        "value": f"{roic:.1f}%" if roic else "N/A",
+        "status": roic_s,
+        "label": "Pass" if roic_s=="green" else ("Warning" if roic_s=="yellow" else "Fail"),
+    }
+    if roic_s=="green":   drivers.append(f"+5: ROIC {roic:.1f}% — strong capital efficiency")
+    elif roic_s=="yellow":drivers.append(f"-2: ROIC {roic:.1f}% — mediocre capital allocation")
+    elif roic_s=="red":   drivers.append(f"-8: ROIC {roic:.1f}% — poor capital efficiency")
+
+    # Gross Margin
+    gm_s = _status(gm, 40, 20)
+    checks["gross_margin"] = {
+        "value": f"{gm:.1f}%" if gm else "N/A",
+        "status": gm_s,
+        "label": "Pricing Power" if gm_s=="green" else ("Average" if gm_s=="yellow" else "Commoditized"),
+    }
+    if gm_s=="green":  drivers.append(f"+5: Gross margin {gm:.1f}% — pricing power intact")
+    elif gm_s=="red":  drivers.append(f"-5: Gross margin {gm:.1f}% — highly commoditized")
+
+    # Debt-to-Equity (spec: <1.0 green, 1-2.5 yellow, >2.5 red)
+    de_s = _status(de, 1.0, 2.5, invert=True)
+    checks["debt_to_equity"] = {
+        "value": f"{de:.2f}x" if de else "N/A",
+        "status": de_s,
+        "label": "Low Leverage" if de_s=="green" else ("Moderate" if de_s=="yellow" else "Over-Leveraged"),
+    }
+    if de and de_s=="red":   drivers.append(f"-8: D/E {de:.2f}x — dangerously over-leveraged")
+    elif de and de_s=="yellow": drivers.append(f"-3: D/E {de:.2f}x — moderate leverage")
+    elif de and de_s=="green":  drivers.append(f"+3: D/E {de:.2f}x — conservative balance sheet")
+
+    # FCF Yield (spec: >5% green, 2-5% yellow, <2% or negative red)
+    fcf_s = _status(fcf_y, 5, 2)
+    checks["fcf_yield"] = {
+        "value": f"{fcf_y:.1f}%" if fcf_y is not None else "N/A",
+        "status": fcf_s,
+        "label": "Strong FCF" if fcf_s=="green" else ("Adequate" if fcf_s=="yellow" else "Weak/Negative"),
+    }
+    if fcf_y and fcf_s=="green":  drivers.append(f"+8: FCF yield {fcf_y:.1f}% — exceptional cash generation")
+    elif fcf_y and fcf_s=="yellow":drivers.append(f"+3: FCF yield {fcf_y:.1f}% — adequate cash generation")
+    elif fcf_y and fcf_s=="red":   drivers.append(f"-8: FCF yield {fcf_y:.1f}% — insufficient cash generation")
+
+    # EPS Predictability: 3+ consecutive years of growth
+    eps_status, eps_label = "gray", "Insufficient Data"
+    if len(eps_hist) >= 3:
+        growing = all(eps_hist[i] > eps_hist[i+1] for i in range(min(3, len(eps_hist)-1)))
+        positive = all(e > 0 for e in eps_hist[:3])
+        if growing and positive:
+            eps_status, eps_label = "green", "Consistent Growth (3yr+)"
+        elif positive:
+            eps_status, eps_label = "yellow", "Positive but Volatile"
+        else:
+            eps_status, eps_label = "red", "Negative or Erratic EPS"
+    checks["eps_predictability"] = {
+        "value": f"{len(eps_hist)} years data",
+        "status": eps_status,
+        "label": eps_label,
+        "history": [round(e,2) for e in eps_hist],
+    }
+    if eps_status=="green":  drivers.append(f"+5: EPS growing consistently for 3+ years")
+    elif eps_status=="red":  drivers.append(f"-8: Negative or erratic EPS — unpredictable earnings")
+
+    buffett_pass = sum(1 for c in ["roic","gross_margin","debt_to_equity","fcf_yield","eps_predictability"]
+                      if checks[c]["status"]=="green")
+    checks["buffett_score"] = {"pass": buffett_pass, "total": 5}
+    if buffett_pass >= 4: drivers.append(f"+5: Strong Buffett Balance Sheet — {buffett_pass}/5 checks passed")
+    elif buffett_pass <= 2: drivers.append(f"-5: Weak Buffett Balance Sheet — only {buffett_pass}/5 checks passed")
+
+    # ── 2. DILUTION (spec format) ─────────────────────────────────────
+    shares     = deep.get("shares_outstanding") or 0
+    shares_pri = deep.get("shares_outstanding_prior") or 0
+    dil_pct    = round((shares - shares_pri) / shares_pri * 100, 1) if shares_pri else None
+    if dil_pct is None:
+        dil_status, dil_msg = "gray", "Insufficient Data"
+    elif dil_pct < 0:
+        dil_status, dil_msg = "green",  "Accretive (Buying Back Shares)"
+        drivers.append(f"+5: Share buyback — float reduced {abs(dil_pct):.1f}% YoY")
+    elif dil_pct <= 2:
+        dil_status, dil_msg = "gray",   "Neutral (Standard Employee Comp)"
+    elif dil_pct <= 10:
+        dil_status, dil_msg = "red",    f"Dilution Alert: Issuing Stock (+{dil_pct:.1f}%)"
+        drivers.append(f"-5: Share dilution {dil_pct:.1f}% YoY")
+    else:
+        dil_status, dil_msg = "red",    f"Toxic Dilution: +{dil_pct:.1f}% YoY"
+        drivers.append(f"-15: Toxic dilution — shares expanded {dil_pct:.1f}% YoY")
+    checks["dilution"] = {
+        "yoy_change": f"{dil_pct:+.1f}%" if dil_pct is not None else "N/A",
+        "status": dil_status,
+        "message": dil_msg,
+        "shares": shares,
+        "shares_prior": shares_pri,
+    }
+
+    # ── 3. CASH RUNWAY ENGINE (spec format) ──────────────────────────
+    fcf_abs   = deep.get("fcf") or 0
+    cash      = deep.get("cash") or 0
+    if fcf_abs >= 0:
+        checks["runway"] = {
+            "status": "green",
+            "message": "Self-Sustaining (Positive FCF)",
+            "months": None,
+            "cash": cash,
+            "fcf": fcf_abs,
+        }
+        drivers.append("+5: Positive FCF — no capital raise risk")
+    else:
+        monthly_burn = abs(fcf_abs) / 12
+        months = round(cash / monthly_burn) if monthly_burn else None
+        if months is None:
+            runway_s, runway_msg = "gray", "Insufficient Data"
+        elif months > 24:
+            runway_s, runway_msg = "green",  f"Comfortable Runway ({months} months)"
+            drivers.append(f"+3: Cash runway {months} months — no near-term raise risk")
+        elif months >= 12:
+            runway_s, runway_msg = "yellow", f"Moderate Runway — Monitoring Required ({months} months)"
+            drivers.append(f"-3: Cash runway {months} months — capital raise possible within 2 years")
+        else:
+            runway_s, runway_msg = "red",    f"Critical Risk — Imminent Dilution or Debt Raise Likely ({months} months)"
+            drivers.append(f"-10: SURVIVAL RISK — only {months} months cash runway")
+        checks["runway"] = {
+            "status": runway_s,
+            "message": runway_msg,
+            "months": months,
+            "cash": cash,
+            "fcf": fcf_abs,
+        }
+
+    # ── 4. STAGE CLASSIFIER (spec: 4 named nodes) ────────────────────
+    rg = m.get("revenue_growth") or 0
+    om = m.get("operating_margin") or 0
+    if rg > 30 and fcf_abs <= 0:
+        stage_node, stage_status = "Early Stage / Venture",   "blue"
+    elif 15 <= rg <= 30:
+        stage_node, stage_status = "Growth Phase",            "green"
+    elif 0 <= rg < 15 and om > 5:
+        stage_node, stage_status = "Mature / Cash Cow",       "green"
+    else:
+        stage_node, stage_status = "Decline / Distressed",    "red"
+        drivers.append("-10: Decline-phase lifecycle risk")
+    checks["stage"] = {
+        "current_node": stage_node,
+        "status": stage_status,
+        "revenue_growth": rg,
+        "operating_margin": om,
+    }
+
+    return {"checks": checks, "drivers": drivers}
+
+
 # ─────────────────────────── Phase classification ──────────────────────────
 def classify_phase(m: dict) -> dict:
     rg  = m.get("revenue_growth") or 0
@@ -286,6 +532,163 @@ def classify_phase(m: dict) -> dict:
     else:
         phase = "DECLINE"; signals.append("Growth below maturity threshold")
     return {"phase": phase, "signals": signals}
+
+# ─────────────────────────── Value Trap Detector ────────────────────────────
+def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
+    """
+    Explicit Value Stock vs Value Trap classification.
+    Returns verdict, confidence, reasons (supporting) and warnings (against).
+
+    Logic:
+      VALUE TRAP  — cheap valuation + broken fundamentals underneath
+      VALUE STOCK — cheap valuation + intact/recovering fundamentals
+      NEUTRAL     — no clear valuation signal either way
+      GROWTH_PLAY — expensive by traditional metrics but justified by growth
+    """
+    fc = forensics.get("checks", {})
+    pe  = m.get("pe_ratio")
+    rg  = m.get("revenue_growth") or 0
+    om  = m.get("operating_margin") or 0
+
+    buffett_score = fc.get("buffett", {}).get("total_pass", 0)
+    dilution_flag = fc.get("dilution", {}).get("flag", "CLEAN")
+    dilution_pct  = fc.get("dilution", {}).get("dilution_pct") or 0
+    stage         = fc.get("stage", {}).get("stage", 2)
+    runway_years  = fc.get("cash_runway", {}).get("years")
+    cash          = fc.get("cash_runway", {}).get("cash") or 0
+    debt          = fc.get("buffett", {}).get("cash_gt_debt", {}).get("debt") or 0
+    retained_grow = fc.get("buffett", {}).get("retained_earnings_growing", {}).get("pass", False)
+    has_treasury  = fc.get("buffett", {}).get("treasury_stock", {}).get("pass", False)
+    preferred     = fc.get("buffett", {}).get("zero_preferred", {}).get("amount", 0)
+
+    # Is it optically "cheap"? (traditional value screen)
+    optically_cheap = pe is not None and 0 < pe < 18
+
+    trap_score = 0     # higher = more trap
+    value_score = 0    # higher = more genuine value
+    reasons = []       # supporting value case
+    warnings = []      # value trap red flags
+
+    # ── VALUE TRAP red flags (each adds to trap_score) ──────────────────
+    if dilution_flag == "TOXIC":
+        trap_score += 40
+        warnings.append(f"🚨 TOXIC DILUTION: shares expanded {dilution_pct:.1f}% YoY — cheap price masks shareholder destruction via equity printing")
+
+    if dilution_flag == "WARNING" and dilution_pct > 5:
+        trap_score += 15
+        warnings.append(f"⚠️ Ongoing dilution {dilution_pct:.1f}% YoY — management issuing equity, eroding per-share value")
+
+    if runway_years is not None and runway_years < 3:
+        trap_score += 30
+        warnings.append(f"🚨 SURVIVAL RISK: {runway_years:.1f} yr cash runway — forced capital raise will dilute at distressed prices")
+
+    if buffett_score <= 1:
+        trap_score += 20
+        warnings.append(f"🚨 Buffett Balance Sheet {buffett_score}/5 — structurally broken balance sheet cannot support recovery")
+
+    if buffett_score == 2:
+        trap_score += 10
+        warnings.append(f"⚠️ Weak balance sheet {buffett_score}/5 — limited financial buffer for downturn")
+
+    if not retained_grow:
+        trap_score += 15
+        warnings.append("⚠️ Retained earnings declining or negative — losses compounding, not reversing")
+
+    if preferred and preferred > 0:
+        trap_score += 10
+        warnings.append(f"⚠️ Preferred stock ${preferred/1e6:.0f}M — hybrid financing signals balance sheet stress")
+
+    if rg < -5:
+        trap_score += 20
+        warnings.append(f"🚨 Revenue contracting {rg:.1f}% — fundamental demand destruction, not cyclical dip")
+
+    if om < -20:
+        trap_score += 15
+        warnings.append(f"⚠️ Deep operating losses ({om:.1f}%) — no visible path to profitability")
+
+    if stage == 1 and optically_cheap and pe:
+        trap_score += 15
+        warnings.append(f"⚠️ Low P/E ({pe:.1f}x) on Stage 1 company — earnings multiple meaningless when operating at a loss")
+
+    # ── VALUE STOCK indicators (each adds to value_score) ──────────────
+    if buffett_score >= 4:
+        value_score += 25
+        reasons.append(f"✅ Fortress balance sheet {buffett_score}/5 Buffett checks — financial durability intact")
+
+    if dilution_flag in ("CLEAN", "BUYBACK"):
+        value_score += 20
+        reasons.append(f"✅ {'Share buybacks reducing float' if dilution_flag == 'BUYBACK' else 'Clean capital structure — no dilution'}")
+
+    if retained_grow:
+        value_score += 15
+        reasons.append("✅ Retained earnings growing — compounding profitability confirmed")
+
+    if has_treasury:
+        value_score += 10
+        reasons.append("✅ Treasury stock present — management returning capital to shareholders")
+
+    if stage >= 3:
+        value_score += 15
+        reasons.append(f"✅ Stage {stage} profitable business — no capital raise risk")
+
+    if om > 15:
+        value_score += 10
+        reasons.append(f"✅ Strong operating margin {om:.1f}% — pricing power and efficiency intact")
+
+    if cash > debt and debt > 0:
+        value_score += 10
+        reasons.append(f"✅ Net cash positive — company can self-fund through downturns")
+
+    if rg > 3 and om > 10:
+        value_score += 10
+        reasons.append(f"✅ Growing and profitable ({rg:.1f}% revenue, {om:.1f}% margin) — recovery catalyst present")
+
+    # ── Final verdict ────────────────────────────────────────────────────
+    if phase == "GROWTH" and pe and pe > 40:
+        verdict = "GROWTH_PLAY"
+        confidence = "HIGH" if buffett_score >= 3 and dilution_flag in ("CLEAN","BUYBACK") else "MEDIUM"
+        summary = (f"Not a value play — priced for growth (P/E {pe:.1f}x). "
+                   f"Evaluate on Rule of 40 and revenue quality, not traditional value metrics.")
+    elif not optically_cheap and pe and pe > 25:
+        verdict = "NOT_VALUE"
+        confidence = "HIGH"
+        summary = f"P/E {pe:.1f}x — not in value territory by traditional screens. Analyze as growth or quality compounder."
+    elif trap_score >= 40 and trap_score > value_score:
+        verdict = "VALUE_TRAP"
+        confidence = "HIGH" if trap_score >= 60 else "MEDIUM"
+        summary = (f"Classic value trap pattern: optically cheap{'(P/E {:.1f}x)'.format(pe) if pe else ''} "
+                   f"but fundamentals are deteriorating underneath. "
+                   f"Trap score {trap_score} vs value score {value_score}.")
+    elif trap_score > 20 and trap_score > value_score * 0.8:
+        verdict = "VALUE_TRAP"
+        confidence = "MEDIUM"
+        summary = f"More trap than value — {len(warnings)} red flags outweigh {len(reasons)} positives."
+    elif value_score >= 40 and optically_cheap:
+        verdict = "VALUE_STOCK"
+        confidence = "HIGH" if value_score >= 60 and trap_score < 15 else "MEDIUM"
+        summary = (f"Genuine value opportunity: cheap{' (P/E {:.1f}x)'.format(pe) if pe else ''} "
+                   f"with intact fundamentals. Value score {value_score} vs trap score {trap_score}.")
+    elif value_score >= 30 and trap_score < 20:
+        verdict = "VALUE_STOCK"
+        confidence = "MEDIUM"
+        summary = f"Leans value — strong fundamentals, moderate valuation."
+    else:
+        verdict = "NEUTRAL"
+        confidence = "LOW"
+        summary = "Mixed signals — insufficient evidence for clear value or trap classification."
+
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "summary": summary,
+        "trap_score": trap_score,
+        "value_score": value_score,
+        "reasons": reasons,
+        "warnings": warnings,
+        "optically_cheap": optically_cheap,
+        "pe_ratio": pe,
+    }
+
 
 # ─────────────────────────── Buy / Hold / Sell engine ───────────────────────
 def compute_signal(m: dict, phase: str) -> dict:
@@ -334,38 +737,226 @@ def compute_signal(m: dict, phase: str) -> dict:
     rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
     return {"score": score, "recommendation": rec, "drivers": drivers}
 
+
+def compute_signal_with_forensics(m: dict, phase: str, forensics: dict) -> dict:
+    """Enhanced signal: base rules + forensic adjustments."""
+    sig = compute_signal(m, phase)
+    score = sig["score"]
+    drivers = list(sig["drivers"])
+
+    for d in forensics.get("drivers", []):
+        drivers.append(d)
+        # Extract numeric adjustment from driver string
+        try:
+            prefix = d.split(":")[0].strip()
+            pts = int(prefix)
+            score += pts
+        except (ValueError, IndexError):
+            pass
+
+    score = max(0, min(100, score))
+    rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
+    return {"score": score, "recommendation": rec, "drivers": drivers}
+
 # ─────────────────────────── AI analysis (Groq, optional) ──────────────────
-def groq_analysis(t, m, phase, sig):
+def groq_analysis(t, m, phase, sig, forensics=None):
+    forensics_ctx = ""
+    if forensics and forensics.get("checks"):
+        fc = forensics["checks"]
+        forensics_ctx = (
+            f" FORENSIC DATA: "
+            f"Business Stage: {fc.get('stage',{}).get('label','Unknown')}. "
+            f"Cash Runway: {fc.get('cash_runway',{}).get('years','N/A')} years. "
+            f"Dilution Flag: {fc.get('dilution',{}).get('flag','Unknown')} "
+            f"(shares changed {fc.get('dilution',{}).get('dilution_pct','N/A')}% YoY). "
+            f"Buffett Balance Sheet: {fc.get('buffett',{}).get('total_pass',0)}/5 checks passed "
+            f"(Cash>Debt:{fc.get('buffett',{}).get('cash_gt_debt',{}).get('pass','?')}, "
+            f"D/E<0.8:{fc.get('buffett',{}).get('debt_to_equity',{}).get('pass','?')}, "
+            f"NoPreferred:{fc.get('buffett',{}).get('zero_preferred',{}).get('pass','?')}, "
+            f"RetainedGrowth:{fc.get('buffett',{}).get('retained_earnings_growing',{}).get('pass','?')}, "
+            f"TreasuryStock:{fc.get('buffett',{}).get('treasury_stock',{}).get('pass','?')})."
+        )
+
     prompt = (
-        f"You are an equity research analyst. Company {t}: {json.dumps(m)}. "
-        f"Lifecycle phase: {phase}. Model signal: {sig['recommendation']} (score {sig['score']}). "
-        'Return ONLY JSON: {"summary":str(2-3 sentences),"phaseRationale":str,'
-        '"strengths":[3 strings],"risks":[3 strings],"mgmtNote":str(1 sentence)}'
+        f"You are a forensic equity research analyst. Company: {t}. "
+        f"Financial metrics: {json.dumps(m)}. "
+        f"Lifecycle phase: {phase}. Signal: {sig['recommendation']} (score {sig['score']}/100). "
+        f"{forensics_ctx}"
+        f" QUALITATIVE MOAT ASSESSMENT — evaluate these 4 lenses and rate each as Anti-fragile, Robust, or Fragile: "
+        f"(1) Liability/Cost of Failure: Would a 90% accuracy rate be catastrophic for this company's customers? "
+        f"(2) Business Model: Is revenue seat-based (per human worker) or usage-based (per compute/work)? Seat-based = Fragile in AI age. "
+        f"(3) Physical World Integration: Does the company integrate with physical hardware (Atoms=Anti-fragile) or pure software (Bits=Fragile)? "
+        f"(4) Network/Data Gravity: Does the company possess proprietary siloed data that public LLMs cannot scrape? "
+        f" Return ONLY JSON with these exact keys: "
+        '{"summary":str(3-4 sentences covering financial health AND moat assessment),'
+        '"phaseRationale":str(why this lifecycle phase based on operating income trajectory),'
+        '"strengths":[3 strings with specific data points],'
+        '"risks":[3 strings with specific data points],'
+        '"moatAssessment":{"liability":{"rating":str,"reasoning":str},"businessModel":{"rating":str,"reasoning":str},"physicalIntegration":{"rating":str,"reasoning":str},"dataGravity":{"rating":str,"reasoning":str}},'
+        '"mgmtNote":str(1 sentence on capital allocation discipline)}'
     )
     r = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
         json={"model": "llama-3.1-8b-instant",
               "messages": [{"role": "user", "content": prompt}],
-              "response_format": {"type": "json_object"}, "temperature": 0.4},
-        timeout=25,
+              "response_format": {"type": "json_object"}, "temperature": 0.3},
+        timeout=30,
     )
     r.raise_for_status()
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
-def fallback_analysis(t, m, phase, sig):
+def fallback_analysis(t, m, phase, sig, forensics=None):
     rg, om = m.get("revenue_growth") or 0, m.get("operating_margin") or 0
+    fc = forensics.get("checks", {}) if forensics else {}
+    buffett_score = fc.get("buffett", {}).get("total_pass", "N/A")
+    dilution = fc.get("dilution", {}).get("flag", "N/A")
+    stage = fc.get("stage", {}).get("label", "N/A")
+    runway = fc.get("cash_runway", {}).get("years")
+    runway_str = f" Cash runway: {runway} years." if runway else ""
+
     return {
         "summary": f"{m.get('name', t)} shows {rg:.1f}% revenue growth with a "
-                   f"{om:.1f}% operating margin, placing it in the {phase} lifecycle phase. "
-                   f"The rules-based model scores it {sig['score']}/100 → {sig['recommendation']}.",
-        "phaseRationale": f"{phase}: classified from revenue growth, margin structure and FCF yield.",
-        "strengths": [d[d.index(':')+2:] for d in sig["drivers"] if d.startswith("+")][:3]
+                   f"{om:.1f}% operating margin ({stage}). "
+                   f"Buffett Balance Sheet: {buffett_score}/5. Dilution: {dilution}.{runway_str} "
+                   f"Model score: {sig['score']}/100 → {sig['recommendation']}.",
+        "phaseRationale": f"{phase}: classified from operating income trajectory, margin structure and FCF yield.",
+        "strengths": [d[d.index(':')+2:] for d in sig["drivers"] if d.startswith("+")][:4]
                      or ["Review fundamentals against sector peers"],
-        "risks": [d[d.index(':')+2:] for d in sig["drivers"] if d.startswith("-")][:3]
+        "risks": [d[d.index(':')+2:] for d in sig["drivers"] if d.startswith("-")][:4]
                  or ["Macro and competitive risks apply"],
-        "mgmtNote": "Management credibility scoring requires earnings-transcript analysis (roadmap).",
+        "moatAssessment": {"note": "Enable GROQ_API_KEY for AI-powered qualitative moat assessment"},
+        "mgmtNote": "Enable GROQ_API_KEY for AI-powered management credibility assessment.",
     }
+
+# ─────────────────────────── Verdict card formatter ─────────────────────────
+COMPLIANCE_SHIELD = (
+    "CRITICAL MARKET RISK DISCLAIMER: The implied market actions and verdicts "
+    "generated above are purely algorithmic data profiles based on historical "
+    "corporate filings and financial metrics. This is an automated mathematical "
+    "analysis, NOT financial, investment, or advisory software. PhaseLens does "
+    "not know your personal financial situation, risk tolerance, or investment "
+    "horizon. All investments are inherently subject to extreme market risk, "
+    "including the permanent loss of principal. PhaseLens does not explicitly "
+    "command you to buy or sell any security. DO YOUR OWN RESEARCH (DYOR). "
+    "You assume 100% of the financial risk for any market actions taken based "
+    "on this analysis."
+)
+
+def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
+    """Format the structured 4-section PhaseLens Verdict card per spec."""
+    vv    = value_verdict.get("verdict", "NEUTRAL")
+    rec   = sig.get("recommendation", "HOLD")
+    score = sig.get("score", 50)
+    reasons  = value_verdict.get("reasons", [])
+    warnings = value_verdict.get("warnings", [])
+    pe  = m.get("pe_ratio")
+    rg  = m.get("revenue_growth") or 0
+    om  = m.get("operating_margin") or 0
+    fcf = m.get("fcf_yield")
+
+    # Section 1: Classification + Market Action Profile
+    classification = {
+        "VALUE_STOCK": "VALUE STOCK",
+        "VALUE_TRAP":  "VALUE TRAP",
+        "GROWTH_PLAY": "NOT APPLICABLE",
+        "NOT_VALUE":   "NOT APPLICABLE",
+        "NEUTRAL":     "NEUTRAL",
+    }.get(vv, "NEUTRAL")
+
+    if vv == "VALUE_TRAP":
+        market_action = "AVOID OR EXIT PROFILE"
+    elif vv in ("GROWTH_PLAY", "NOT_VALUE"):
+        market_action = "NOT APPLICABLE"
+    elif rec == "BUY" and score >= 80:
+        market_action = "STRONG BUY PROFILE"
+    elif rec == "BUY":
+        market_action = "ACCUMULATE PROFILE"
+    elif rec == "HOLD":
+        market_action = "HOLD OR WATCH PROFILE"
+    else:
+        market_action = "AVOID OR EXIT PROFILE"
+
+    # Section 2: Reasoning
+    if classification == "VALUE STOCK":
+        top_reasons = "; ".join(r.replace("✅ ","") for r in reasons[:3]) or "strong fundamentals"
+        reasoning = (
+            f"This company exhibits core hallmarks of genuine value: {top_reasons}. "
+            f"The stock appears undervalued relative to its intrinsic financial health — "
+            f"{f'P/E {pe:.1f}x, ' if pe else ''}{om:.1f}% operating margin, "
+            f"{'and ' + str(fcf) + '% FCF yield' if fcf else 'with positive cash generation'}. "
+            f"Balance sheet strength and capital allocation discipline support the investment case."
+        )
+    elif classification == "VALUE TRAP":
+        top_warnings = [w.replace("🚨 ","").replace("⚠️ ","") for w in warnings[:3]]
+        reasoning = (
+            f"Classic value trap pattern — optically cheap metrics obscure deteriorating "
+            f"fundamentals. Key red flags: {'; '.join(top_warnings) or 'balance sheet stress and declining margins'}. "
+            f"{'Low P/E of ' + str(round(pe,1)) + 'x is misleading — ' if pe and pe < 18 else ''}"
+            f"the cheap price reflects structural business problems, not temporary sentiment."
+        )
+    elif classification == "NEUTRAL":
+        reasoning = (
+            f"Current valuation{f' (P/E {pe:.1f}x)' if pe else ''} fairly reflects risk-reward. "
+            f"Revenue growth {rg:.1f}% and operating margin {om:.1f}% are neither compelling "
+            f"enough for a strong buy nor deteriorating enough to classify as a trap. "
+            f"A more favorable margin of safety or clear catalyst is needed."
+        )
+    else:
+        reasoning = (
+            f"Traditional value metrics cannot accurately assess this company. "
+            f"{'High-growth profile (revenue +' + str(rg) + '%) prices in future execution, not current earnings. ' if rg > 20 else ''}"
+            f"{'Pre-profitability means P/E is not meaningful. ' if om < 0 else ''}"
+            f"Evaluate on growth metrics: Rule of 40, NRR, TAM penetration, cash runway."
+        )
+
+    # Section 3: Implied Market Action
+    if classification == "VALUE STOCK":
+        action_text = (
+            "This profile historically represents an asymmetric risk-reward opportunity "
+            "where fundamentals outpace market sentiment. Investors looking for long-term "
+            "equity growth typically view this as a potential BUY/ACCUMULATE candidate, "
+            "provided it aligns with their risk tolerance."
+        )
+    elif classification == "VALUE TRAP":
+        action_text = (
+            "This profile historically represents a capital destruction risk where low "
+            "multiples hide deteriorating core business health. Investors looking to "
+            "protect capital typically view this as a SELL/AVOID candidate to prevent "
+            "catching a falling knife."
+        )
+    else:
+        action_text = (
+            "This profile suggests waiting for a structural shift or a more favorable "
+            "margin of safety. Market participants typically HOLD or keep this on a "
+            "watch list, as current data does not present a high-conviction signal."
+        )
+
+    return {
+        "section1": {
+            "title": "FINAL VERDICT",
+            "classification": classification,
+            "market_action_profile": market_action,
+            "confidence": value_verdict.get("confidence", "MEDIUM"),
+            "trap_score": value_verdict.get("trap_score", 0),
+            "value_score": value_verdict.get("value_score", 0),
+        },
+        "section2": {
+            "title": "THE REASONING",
+            "reasoning": reasoning,
+            "supporting": reasons,
+            "red_flags": warnings,
+        },
+        "section3": {
+            "title": "IMPLIED MARKET ACTION & RISK ASSESSMENT",
+            "text": action_text,
+        },
+        "section4": {
+            "title": "MANDATORY COMPLIANCE SHIELD",
+            "text": COMPLIANCE_SHIELD,
+        },
+    }
+
 
 DISCLAIMER = ("PhaseLens is an educational research tool — not a licensed financial advisor, "
               "broker, or consultant. Signals are generated automatically by a rules-based model "
@@ -393,26 +984,71 @@ def api_analyze(ticker: str):
         return hit[1]
     m = fetch_stock(t)
     ph = classify_phase(m)
-    sig = compute_signal(m, ph["phase"])
+    deep = fetch_deep_data(t)
+    forensics = compute_forensics(m, deep)
+    sig = compute_signal_with_forensics(m, ph["phase"], forensics)
     if GROQ_API_KEY:
         try:
-            ai = groq_analysis(t, m, ph["phase"], sig)
+            ai = groq_analysis(t, m, ph["phase"], sig, forensics)
         except Exception:
-            ai = fallback_analysis(t, m, ph["phase"], sig)
+            ai = fallback_analysis(t, m, ph["phase"], sig, forensics)
     else:
-        ai = fallback_analysis(t, m, ph["phase"], sig)
+        ai = fallback_analysis(t, m, ph["phase"], sig, forensics)
+    value_verdict = compute_value_verdict(m, forensics, ph["phase"])
+    verdict_card  = format_verdict_card(sig, value_verdict, m)
     payload = {
         "ticker": t, "name": m.get("name"), "price": m.get("price"),
         "phase": ph["phase"], "phaseSignals": ph["signals"],
         "score": sig["score"], "recommendation": sig["recommendation"],
         "signalDrivers": sig["drivers"], "metrics": m,
+        "forensics": forensics.get("checks"),
+        "verdictCard": verdict_card,
+        "moatAssessment": ai.get("moatAssessment"),
         "summary": ai.get("summary"), "phaseRationale": ai.get("phaseRationale"),
         "strengths": ai.get("strengths"), "risks": ai.get("risks"),
-        "mgmtNote": ai.get("mgmtNote"), "disclaimer": DISCLAIMER,
+        "mgmtNote": ai.get("mgmtNote"),
+        "disclaimer": DISCLAIMER,
+        "complianceShield": COMPLIANCE_SHIELD,
         "generated_at": now_iso(),
     }
     _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)
     return payload
+
+# ─────────────────────────── Terms agreement ────────────────────────────────
+class TermsIn(BaseModel):
+    visitor_id: str
+    email: str | None = None
+
+@app.post("/api/terms/agree")
+def api_terms_agree(body: TermsIn):
+    """Record that a visitor has agreed to PhaseLens Terms of Use."""
+    vid = body.visitor_id[:64]
+    now = now_iso()
+    with db() as conn:
+        c = conn.cursor()
+        # Upsert into terms table
+        c.execute(q("SELECT visitor_id FROM terms WHERE visitor_id=?"), (vid,))
+        if c.fetchone():
+            c.execute(q("UPDATE terms SET agreed_at=?, email=? WHERE visitor_id=?"),
+                      (now, (body.email or "")[:120], vid))
+        else:
+            c.execute(q("INSERT INTO terms(visitor_id,email,agreed_at) VALUES(?,?,?)"),
+                      (vid, (body.email or "")[:120], now))
+        # Log event
+        c.execute(q("INSERT INTO events(visitor_id,email,event,ticker,created_at) VALUES(?,?,?,?,?)"),
+                  (vid, (body.email or "")[:120], "terms_agreed", "", now))
+    return {"ok": True, "terms_agreed_at": now}
+
+@app.get("/api/terms/status/{visitor_id}")
+def api_terms_status(visitor_id: str):
+    """Check if a visitor has already agreed to terms."""
+    vid = visitor_id[:64]
+    with db() as conn:
+        c = conn.cursor()
+        c.execute(q("SELECT agreed_at FROM terms WHERE visitor_id=?"), (vid,))
+        row = c.fetchone()
+        agreed = bool(row and row[0])
+        return {"agreed": agreed, "terms_agreed_at": row[0] if agreed else None}
 
 # ─────────────────────────── Auth session ───────────────────────────────────
 class SessionIn(BaseModel):
