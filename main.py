@@ -146,7 +146,7 @@ MOCK_DATA = {
 
 def _fmp_get(path: str) -> dict:
     """Call FMP API and return parsed JSON. Raises HTTPException on failure."""
-    url = f"https://financialmodelingprep.com/api/v3/{path}&apikey={FMP_API_KEY}"
+    url = f"https://financialmodelingprep.com/stable/{path}&apikey={FMP_API_KEY}"
     r = httpx.get(url, timeout=15)
     if r.status_code == 401:
         raise HTTPException(503, "FMP API key invalid — check FMP_API_KEY on Render")
@@ -167,41 +167,40 @@ def fetch_stock(ticker: str) -> dict:
     if MOCK:
         data = dict(MOCK_DATA, ticker=t, name=f"{t} Inc (mock)")
     elif FMP_API_KEY:
-        # ── Financial Modeling Prep — FREE tier endpoints only ──
-        # /profile      → price, marketCap, companyName  (FREE)
-        # /ratios-ttm   → PE, margins, FCF yield         (FREE)
-        # /income-statement → revenue history            (FREE)
-        # NOTE: /quote and /key-metrics-ttm are PAID — do not use them
+        # ── Financial Modeling Prep — /stable/ endpoints (your free key works here) ──
+        # /stable/quote              → price, marketCap, name, PE, volume
+        # /stable/ratios-ttm         → margins, FCF yield, debt/equity
+        # /stable/income-statement   → revenue history for growth calc
         try:
-            # Profile: price + name + market cap
-            profile_raw = _fmp_get(f"profile/{t}?")
-            if not profile_raw or not isinstance(profile_raw, list):
-                raise HTTPException(503, f"No data for {t} — verify the ticker exists on FMP")
-            p = profile_raw[0]
+            # Quote: real-time price + core fields
+            quote_raw = _fmp_get(f"quote?symbol={t}")
+            if not quote_raw or not isinstance(quote_raw, list):
+                raise HTTPException(503, f"No data for {t} — verify the ticker symbol")
+            q = quote_raw[0]
 
-            # Ratios TTM: PE, margins, FCF yield, debt/equity, dividend yield
-            ratios_raw = _fmp_get(f"ratios-ttm/{t}?")
+            # Ratios TTM: margins, FCF yield, debt/equity, dividend yield
+            ratios_raw = _fmp_get(f"ratios-ttm?symbol={t}")
             r = ratios_raw[0] if ratios_raw and isinstance(ratios_raw, list) else {}
 
-            # Income statement: 2 years to compute revenue growth
-            income_raw = _fmp_get(f"income-statement/{t}?limit=2&period=annual")
+            # Income statement: 2 years for revenue growth
+            income_raw = _fmp_get(f"income-statement?symbol={t}&limit=2&period=annual")
             rev_growth = None
             if income_raw and len(income_raw) >= 2:
                 r_new = income_raw[0].get("revenue") or 0
                 r_old = income_raw[1].get("revenue") or 1
                 rev_growth = round((r_new - r_old) / abs(r_old) * 100, 1) if r_old else None
 
-            price = p.get("price")
-            mc    = p.get("mktCap") or 0
+            price = q.get("price")
+            mc    = q.get("marketCap") or 0
 
             if not price:
                 raise HTTPException(503, f"No price returned for {t} — check ticker symbol")
 
             data = {
                 "ticker":           t,
-                "name":             p.get("companyName") or t,
+                "name":             q.get("name") or t,
                 "price":            price,
-                "pe_ratio":         r.get("peRatioTTM"),
+                "pe_ratio":         q.get("pe"),
                 "fcf_yield":        round((r.get("freeCashFlowYieldTTM") or 0) * 100, 2) or None,
                 "gross_margin":     round((r.get("grossProfitMarginTTM") or 0) * 100, 1),
                 "operating_margin": round((r.get("operatingProfitMarginTTM") or 0) * 100, 1),
