@@ -196,17 +196,32 @@ def fetch_stock(ticker: str) -> dict:
             if not price:
                 raise HTTPException(503, f"No price returned for {t} — check ticker symbol")
 
+            # Helper: get a ratio field trying multiple common FMP field name variants
+            def ratio(primary, *fallbacks, pct=False, scale=1):
+                for key in (primary,) + fallbacks:
+                    v = r.get(key)
+                    if v is None: v = q.get(key)   # also check quote object
+                    if v is not None and v != 0:
+                        return round(float(v) * (100 if pct else 1) * scale, 2)
+                return None
+
             data = {
                 "ticker":           t,
                 "name":             q.get("name") or t,
                 "price":            price,
-                "pe_ratio":         q.get("pe"),
-                "fcf_yield":        round((r.get("freeCashFlowYieldTTM") or 0) * 100, 2) or None,
-                "gross_margin":     round((r.get("grossProfitMarginTTM") or 0) * 100, 1),
-                "operating_margin": round((r.get("operatingProfitMarginTTM") or 0) * 100, 1),
+                # PE: quote has it directly; ratios has peRatioTTM
+                "pe_ratio":         ratio("peRatioTTM", "pe", "priceEarningsRatioTTM"),
+                # FCF yield: try multiple field name variants FMP uses
+                "fcf_yield":        ratio("freeCashFlowYieldTTM", "freeCashflowYieldTTM",
+                                          "fcfYieldTTM", pct=True),
+                "gross_margin":     round((r.get("grossProfitMarginTTM") or 0) * 100, 1) or None,
+                "operating_margin": round((r.get("operatingProfitMarginTTM") or 0) * 100, 1) or None,
                 "revenue_growth":   rev_growth,
-                "dividend_yield":   round((r.get("dividendYieldTTM") or 0) * 100, 2),
-                "debt_to_equity":   round(r.get("debtEquityRatioTTM") or 0, 2) or None,
+                # Dividend yield: quote has raw decimal, ratios has TTM version
+                "dividend_yield":   ratio("dividendYieldTTM", "dividendYield", pct=True),
+                # Debt/equity: ratios field OR compute from quote if available
+                "debt_to_equity":   ratio("debtEquityRatioTTM", "debtToEquityRatioTTM",
+                                          "totalDebtToEquityTTM"),
                 "market_cap":       mc,
             }
         except HTTPException:
