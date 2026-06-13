@@ -3,6 +3,7 @@ PhaseLens API v2 — live market data, AI analysis, Buy/Hold/Sell engine,
 Firebase sign-in (email + Google), visitor analytics, admin dashboard.
 
 Env vars (set these on Render):
+  FMP_API_KEY          Financial Modeling Prep key — free at financialmodelingprep.com
   FIREBASE_PROJECT_ID  required for sign-in — your Firebase project ID
   ADMIN_EMAIL          admin account email   (default: nmohanaraman@gmail.com)
   ADMIN_KEY            fallback admin key for the dashboard (any long random string)
@@ -23,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+FMP_API_KEY         = os.environ.get("FMP_API_KEY", "")
 ADMIN_KEY           = os.environ.get("ADMIN_KEY", "")
 ADMIN_EMAIL         = os.environ.get("ADMIN_EMAIL", "nmohanaraman@gmail.com").strip().lower()
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
@@ -142,6 +144,21 @@ MOCK_DATA = {
     "market_cap": 50_000_000_000,
 }
 
+def _fmp_get(path: str) -> dict:
+    """Call FMP API and return parsed JSON. Raises HTTPException on failure."""
+    url = f"https://financialmodelingprep.com/api/v3/{path}&apikey={FMP_API_KEY}"
+    r = httpx.get(url, timeout=15)
+    if r.status_code == 401:
+        raise HTTPException(503, "FMP API key invalid — check FMP_API_KEY on Render")
+    if r.status_code == 429:
+        raise HTTPException(503, "FMP daily limit reached (250/day on free plan)")
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "Error Message" in data:
+        raise HTTPException(503, f"FMP error: {data['Error Message']}")
+    return data
+
+
 def fetch_stock(ticker: str) -> dict:
     t = ticker.upper().strip()
     hit = _stock_cache.get(t)
@@ -149,63 +166,78 @@ def fetch_stock(ticker: str) -> dict:
         return hit[1]
     if MOCK:
         data = dict(MOCK_DATA, ticker=t, name=f"{t} Inc (mock)")
+    elif FMP_API_KEY:
+        # ── Financial Modeling Prep (primary — reliable on cloud servers) ──
+        try:
+            # Quote endpoint: real-time price + basic info
+            quotes = _fmp_get(f"quote/{t}?")
+            if not quotes or not isinstance(quotes, list):
+                raise HTTPException(503, f"No data returned for {t} — check the ticker symbol")
+            q = quotes[0]
+
+            # Key metrics endpoint: FCF yield, PE, margins
+            metrics_raw = _fmp_get(f"key-metrics-ttm/{t}?limit=1")
+            m = metrics_raw[0] if metrics_raw and isinstance(metrics_raw, list) else {}
+
+            # Income statement: revenue growth
+            income_raw = _fmp_get(f"income-statement/{t}?limit=2&period=annual")
+            rev_growth = None
+            if income_raw and len(income_raw) >= 2:
+                r_new = income_raw[0].get("revenue") or 0
+                r_old = income_raw[1].get("revenue") or 1
+                rev_growth = round((r_new - r_old) / abs(r_old) * 100, 1) if r_old else None
+
+            mc  = q.get("marketCap") or 0
+            fcf = m.get("freeCashFlowPerShareTTM", 0) or 0
+            shares = q.get("sharesOutstanding") or 0
+            fcf_total = fcf * shares
+            fcf_yield = round(fcf_total / mc * 100, 2) if mc else None
+
+            data = {
+                "ticker": t,
+                "name":              q.get("name") or t,
+                "price":             q.get("price"),
+                "pe_ratio":          q.get("pe"),
+                "fcf_yield":         fcf_yield,
+                "gross_margin":      round((m.get("grossProfitMarginTTM") or 0) * 100, 1),
+                "operating_margin":  round((m.get("operatingProfitMarginTTM") or 0) * 100, 1),
+                "revenue_growth":    rev_growth,
+                "dividend_yield":    round((q.get("dividendYield") or 0) * 100, 2),
+                "debt_to_equity":    round(m.get("debtToEquityTTM") or 0, 2) or None,
+                "market_cap":        mc,
+            }
+            if not data["price"]:
+                raise HTTPException(503, f"No price returned for {t}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(503, f"Market data unavailable for {t}: {exc}")
     else:
-        import yfinance as yf
-        import requests as _req
-
-        # Real browser User-Agent — Yahoo is more lenient with these
-        session = _req.Session()
-        session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-
-        last_exc = None
-        info = {}
-        for attempt in range(3):
-            try:
-                tk = yf.Ticker(t, session=session)
-                info = tk.info
-                # yfinance returns a minimal dict when rate-limited — check for price
-                if not info.get("regularMarketPrice") and not info.get("currentPrice"):
-                    fi = tk.fast_info
-                    price_fb = getattr(fi, "last_price", None)
-                    if price_fb:
-                        info["currentPrice"] = price_fb
-                if info.get("currentPrice") or info.get("regularMarketPrice"):
-                    break
-                time.sleep(2 ** attempt)
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(2 ** attempt)
-
-        mc     = info.get("marketCap") or 0
-        fcf    = info.get("freeCashflow") or 0
-        de_raw = info.get("debtToEquity")
-        price  = info.get("currentPrice") or info.get("regularMarketPrice")
-
-        if not price:
-            msg = str(last_exc) if last_exc else "Yahoo Finance returned no price after 3 attempts"
-            raise HTTPException(503, f"Market data unavailable for {t}: {msg}")
-
-        data = {
-            "ticker": t,
-            "name": info.get("longName") or info.get("shortName") or t,
-            "price": price,
-            "pe_ratio": info.get("trailingPE"),
-            "fcf_yield": round(fcf / mc * 100, 2) if mc else None,
-            "gross_margin": round((info.get("grossMargins") or 0) * 100, 1),
-            "operating_margin": round((info.get("operatingMargins") or 0) * 100, 1),
-            "revenue_growth": round((info.get("revenueGrowth") or 0) * 100, 1),
-            "dividend_yield": round((info.get("dividendYield") or 0) * 100, 2),
-            "debt_to_equity": round(de_raw / 100, 2) if de_raw else None,
-            "market_cap": mc,
-        }
+        # ── yfinance fallback (works locally, unreliable on cloud) ──
+        try:
+            import yfinance as yf
+            info = yf.Ticker(t).info
+            mc     = info.get("marketCap") or 0
+            fcf    = info.get("freeCashflow") or 0
+            de_raw = info.get("debtToEquity")
+            price  = info.get("currentPrice") or info.get("regularMarketPrice")
+            if not price:
+                raise ValueError("no price returned")
+            data = {
+                "ticker": t,
+                "name":             info.get("longName") or info.get("shortName") or t,
+                "price":            price,
+                "pe_ratio":         info.get("trailingPE"),
+                "fcf_yield":        round(fcf / mc * 100, 2) if mc else None,
+                "gross_margin":     round((info.get("grossMargins") or 0) * 100, 1),
+                "operating_margin": round((info.get("operatingMargins") or 0) * 100, 1),
+                "revenue_growth":   round((info.get("revenueGrowth") or 0) * 100, 1),
+                "dividend_yield":   round((info.get("dividendYield") or 0) * 100, 2),
+                "debt_to_equity":   round(de_raw / 100, 2) if de_raw else None,
+                "market_cap":       mc,
+            }
+        except Exception as exc:
+            raise HTTPException(503, f"Market data unavailable for {t}: {exc}. Set FMP_API_KEY on Render for reliable data.")
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
