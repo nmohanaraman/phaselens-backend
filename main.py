@@ -353,6 +353,7 @@ DISCLAIMER = ("PhaseLens is an educational research tool — not a licensed fina
 def root():
     return {"service": "PhaseLens API", "version": "2.0", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
+            "fmp_enabled": bool(FMP_API_KEY),
             "auth_enabled": bool(FIREBASE_PROJECT_ID)}
 
 @app.get("/api/stock/{ticker}")
