@@ -794,17 +794,38 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         f"Financial metrics: {json.dumps(m)}. "
         f"Lifecycle phase: {phase}. Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
-        f" QUALITATIVE MOAT ASSESSMENT — evaluate these 4 lenses and rate each as Anti-fragile, Robust, or Fragile: "
-        f"(1) Liability/Cost of Failure: Would a 90% accuracy rate be catastrophic for this company's customers? "
-        f"(2) Business Model: Is revenue seat-based (per human worker) or usage-based (per compute/work)? Seat-based = Fragile in AI age. "
-        f"(3) Physical World Integration: Does the company integrate with physical hardware (Atoms=Anti-fragile) or pure software (Bits=Fragile)? "
-        f"(4) Network/Data Gravity: Does the company possess proprietary siloed data that public LLMs cannot scrape? "
+        f" QUALITATIVE MOAT ASSESSMENT — evaluate these 4 structural lenses. Rate each strictly as Anti-fragile, Robust, or Fragile. "
+        f"Use the ACTUAL business model of {t}, not assumptions from another industry. "
+
+        f"LENS 1 — COST OF FAILURE (Liability): "
+        f"For SOFTWARE companies: would a 90% AI accuracy rate cause catastrophic legal/operational damage? "
+        f"For PHYSICAL RETAIL, HEALTHCARE, MANUFACTURING companies: would a supply chain failure, product recall, or service disruption be catastrophic and unrecoverable? "
+        f"Anti-fragile = errors cause permanent brand damage or legal liability (FDA trials, financial fraud). Fragile = errors are minor and easily fixed (marketing copy). "
+
+        f"LENS 2 — BUSINESS MODEL (Revenue Structure): "
+        f"CRITICAL DEFINITIONS: "
+        f"'Seat-based' means charging PER HUMAN EMPLOYEE or PER USER LICENSE (like Salesforce, Workday, Microsoft Office). This IS Fragile because AI reduces headcount. "
+        f"'Membership subscription' (like Costco $65/year, Netflix) is NOT seat-based — it is ANTI-FRAGILE because it is recurring, inflation-resistant, and usage-agnostic. "
+        f"'Usage-based' (like AWS per-compute) = Anti-fragile as AI increases usage. "
+        f"'Transaction-based' (retail, restaurants) = Robust to Fragile depending on brand loyalty. "
+        f"Correctly identify which category {t} belongs to before rating. "
+
+        f"LENS 3 — PHYSICAL WORLD INTEGRATION (Atoms vs Bits): "
+        f"Does the company REQUIRE physical infrastructure that cannot be replaced by software? "
+        f"Anti-fragile examples: warehouse retail (Costco), hospitals, manufacturing, logistics hubs, body cameras. "
+        f"Fragile examples: pure SaaS, content platforms, digital marketplaces with no physical component. "
+
+        f"LENS 4 — NETWORK / DATA GRAVITY: "
+        f"Does the company possess proprietary data or network effects that public LLMs cannot access or replicate? "
+        f"Anti-fragile: member purchase histories (Costco 130M+ cardholders), proprietary financial data, clinical trial data. "
+        f"Fragile: generic content, easily scraped web data, no switching costs. "
+
         f" Return ONLY JSON with these exact keys: "
-        '{"summary":str(3-4 sentences covering financial health AND moat assessment),'
+        '{"summary":str(3-4 sentences covering financial health AND moat assessment with company-specific evidence),'
         '"phaseRationale":str(why this lifecycle phase based on operating income trajectory),'
-        '"strengths":[3 strings with specific data points],'
+        '"strengths":[3 strings with specific quantitative data points],'
         '"risks":[3 strings with specific data points],'
-        '"moatAssessment":{"liability":{"rating":str,"reasoning":str},"businessModel":{"rating":str,"reasoning":str},"physicalIntegration":{"rating":str,"reasoning":str},"dataGravity":{"rating":str,"reasoning":str}},'
+        '"moatAssessment":{"liability":{"rating":str,"reasoning":str(2 sentences, company-specific)},"businessModel":{"rating":str,"reasoning":str(2 sentences, name the specific revenue model type)},"physicalIntegration":{"rating":str,"reasoning":str(2 sentences, name the physical assets)},"dataGravity":{"rating":str,"reasoning":str(2 sentences, name the specific data advantage)}},'
         '"mgmtNote":str(1 sentence on capital allocation discipline)}'
     )
     r = httpx.post(
@@ -812,7 +833,7 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
         json={"model": "llama-3.1-8b-instant",
               "messages": [{"role": "user", "content": prompt}],
-              "response_format": {"type": "json_object"}, "temperature": 0.3},
+              "response_format": {"type": "json_object"}, "temperature": 0.2},
         timeout=30,
     )
     r.raise_for_status()
