@@ -157,6 +157,285 @@ _stock_cache: dict = {}
 _analysis_cache: dict = {}
 STOCK_TTL, ANALYSIS_TTL = 900, 21600
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ETF LOOK-THROUGH VALUATION ENGINE
+# Methodology: pierce the wrapper, aggregate weighted fundamentals,
+# assess structural drag (NAV premium, expense ratio)
+# FMP endpoints: etf-holder, key-metrics-ttm, income-statement, quote, etf-info
+# Cache: holdings = 7 days, constituent metrics = 24 hours
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ETF_HOLDINGS_CACHE: dict = {}
+_ETF_CONST_CACHE: dict = {}
+ETF_HOLDINGS_TTL = 7 * 24 * 3600  # 7 days — holdings change weekly
+ETF_CONST_TTL    = 24 * 3600      # 24 hours — metrics change daily
+
+KNOWN_ETFS = {
+    "SPY","VOO","VTI","QQQ","QQQM","VGT","SMH","SCHD","BND","VXUS",
+    "FNILX","SPAXX","IVV","VUG","VTV","VYM","JEPI","AGG","TLT","GLD",
+    "XLK","XLF","XLE","XLV","XLY","XLI","XLU","XLRE","XLC","XLB","XLP",
+    "ARKK","SOXX","IWM","MDY","DIA","EEM","EFA","IEFA","ACWI","VEA",
+    "BNDX","LQD","HYG","SHY","IEF","RSP","COWZ","QUAL","MTUM","USMV",
+    "VIG","DVY","SDY","VNQ","SOXQ","MAGS","CQQQ","KWEB",
+}
+BOND_FUNDS = {"BND","BNDX","AGG","TLT","IEF","SHY","LQD","HYG","SPAXX","VMFXX","FDRXX"}
+FINANCIAL_SECTORS = {"Financial Services","Financials","Banking","Insurance","Financial"}
+
+def is_etf(ticker: str) -> bool:
+    t = ticker.upper().strip()
+    if t in KNOWN_ETFS or t in BOND_FUNDS:
+        return True
+    if FMP_API_KEY and not MOCK:
+        try:
+            info = _fmp_get(f"etf-info?symbol={t}")
+            if info and isinstance(info, list) and info:
+                return True
+        except Exception:
+            pass
+    return False
+
+def fetch_etf_holdings(ticker: str) -> list:
+    t = ticker.upper().strip()
+    now = time.time()
+    if t in _ETF_HOLDINGS_CACHE:
+        ts, data = _ETF_HOLDINGS_CACHE[t]
+        if now - ts < ETF_HOLDINGS_TTL:
+            return data
+    if MOCK or not FMP_API_KEY:
+        mock = {
+            "VOO":  [{"asset":"AAPL","weightPercentage":7.2},{"asset":"MSFT","weightPercentage":6.8},{"asset":"NVDA","weightPercentage":6.5},{"asset":"AMZN","weightPercentage":3.8},{"asset":"META","weightPercentage":2.5},{"asset":"GOOGL","weightPercentage":2.1},{"asset":"BRK.B","weightPercentage":1.7},{"asset":"TSLA","weightPercentage":1.5},{"asset":"UNH","weightPercentage":1.4},{"asset":"AVGO","weightPercentage":1.3}],
+            "QQQ":  [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1},{"asset":"GOOGL","weightPercentage":2.5},{"asset":"COST","weightPercentage":2.5},{"asset":"AVGO","weightPercentage":2.3},{"asset":"NFLX","weightPercentage":1.8}],
+            "QQQM": [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1},{"asset":"GOOGL","weightPercentage":2.5},{"asset":"COST","weightPercentage":2.5},{"asset":"AVGO","weightPercentage":2.3},{"asset":"NFLX","weightPercentage":1.8}],
+            "SMH":  [{"asset":"NVDA","weightPercentage":19.8},{"asset":"TSM","weightPercentage":12.1},{"asset":"AVGO","weightPercentage":7.8},{"asset":"ASML","weightPercentage":5.2},{"asset":"AMD","weightPercentage":4.9},{"asset":"QCOM","weightPercentage":4.1},{"asset":"MU","weightPercentage":3.8},{"asset":"LRCX","weightPercentage":3.5},{"asset":"KLAC","weightPercentage":3.2},{"asset":"AMAT","weightPercentage":3.0}],
+            "SCHD": [{"asset":"EOG","weightPercentage":4.2},{"asset":"CVX","weightPercentage":4.1},{"asset":"HD","weightPercentage":4.0},{"asset":"PEP","weightPercentage":3.9},{"asset":"AMGN","weightPercentage":3.8},{"asset":"KO","weightPercentage":3.7},{"asset":"MRK","weightPercentage":3.6},{"asset":"VZ","weightPercentage":3.5},{"asset":"IBM","weightPercentage":3.4},{"asset":"PAYX","weightPercentage":3.3}],
+            "VGT":  [{"asset":"AAPL","weightPercentage":15.2},{"asset":"MSFT","weightPercentage":14.8},{"asset":"NVDA","weightPercentage":13.5},{"asset":"AVGO","weightPercentage":4.8},{"asset":"AMD","weightPercentage":2.9},{"asset":"CRM","weightPercentage":2.1},{"asset":"ORCL","weightPercentage":2.0},{"asset":"AMAT","weightPercentage":1.8},{"asset":"ADSK","weightPercentage":1.5},{"asset":"QCOM","weightPercentage":1.4}],
+            "VTI":  [{"asset":"AAPL","weightPercentage":6.5},{"asset":"MSFT","weightPercentage":6.1},{"asset":"NVDA","weightPercentage":5.8},{"asset":"AMZN","weightPercentage":3.4},{"asset":"META","weightPercentage":2.2},{"asset":"GOOGL","weightPercentage":1.9},{"asset":"BRK.B","weightPercentage":1.6},{"asset":"TSLA","weightPercentage":1.4},{"asset":"UNH","weightPercentage":1.2},{"asset":"AVGO","weightPercentage":1.1}],
+            "VXUS": [{"asset":"TSM","weightPercentage":2.1},{"asset":"ASML","weightPercentage":1.2},{"asset":"NESN","weightPercentage":1.1},{"asset":"SAMSUNG","weightPercentage":0.9},{"asset":"LVMH","weightPercentage":0.8},{"asset":"NOVO","weightPercentage":0.7},{"asset":"SHEL","weightPercentage":0.7},{"asset":"AZN","weightPercentage":0.6},{"asset":"HSBC","weightPercentage":0.6},{"asset":"ROCHE","weightPercentage":0.5}],
+            "FNILX":[{"asset":"AAPL","weightPercentage":7.1},{"asset":"MSFT","weightPercentage":6.7},{"asset":"NVDA","weightPercentage":6.4},{"asset":"AMZN","weightPercentage":3.7},{"asset":"META","weightPercentage":2.4},{"asset":"GOOGL","weightPercentage":2.0},{"asset":"BRK.B","weightPercentage":1.6},{"asset":"TSLA","weightPercentage":1.4},{"asset":"UNH","weightPercentage":1.3},{"asset":"AVGO","weightPercentage":1.2}],
+        }
+        data = mock.get(t, [{"asset":"AAPL","weightPercentage":20.0},{"asset":"MSFT","weightPercentage":18.0},{"asset":"NVDA","weightPercentage":15.0}])
+        _ETF_HOLDINGS_CACHE[t] = (now, data)
+        return data
+    try:
+        raw = _fmp_get(f"etf-holder?symbol={t}")
+        if not raw or not isinstance(raw, list): return []
+        raw.sort(key=lambda x: float(x.get("weightPercentage") or 0), reverse=True)
+        top, cumulative = [], 0.0
+        for h in raw:
+            w = float(h.get("weightPercentage") or 0)
+            if w <= 0: continue
+            top.append(h); cumulative += w
+            if cumulative >= 80.0 or len(top) >= 30: break
+        _ETF_HOLDINGS_CACHE[t] = (now, top)
+        return top
+    except Exception:
+        return []
+
+MOCK_CONSTITUENT = {
+    "AAPL":{"roic":28.5,"gross_margin":47.9,"debt_to_equity":0.8,"fcf_yield":3.5,"sector":"Technology"},
+    "MSFT":{"roic":32.0,"gross_margin":70.1,"debt_to_equity":0.3,"fcf_yield":2.8,"sector":"Technology"},
+    "NVDA":{"roic":110.0,"gross_margin":76.3,"debt_to_equity":0.1,"fcf_yield":2.1,"sector":"Technology"},
+    "AMZN":{"roic":19.5,"gross_margin":48.2,"debt_to_equity":0.4,"fcf_yield":3.2,"sector":"Consumer Cyclical"},
+    "META":{"roic":31.0,"gross_margin":82.1,"debt_to_equity":0.1,"fcf_yield":4.1,"sector":"Technology"},
+    "GOOGL":{"roic":25.0,"gross_margin":58.0,"debt_to_equity":0.1,"fcf_yield":4.2,"sector":"Technology"},
+    "TSLA":{"roic":8.0,"gross_margin":17.1,"debt_to_equity":0.1,"fcf_yield":1.2,"sector":"Consumer Cyclical"},
+    "COST":{"roic":19.0,"gross_margin":12.9,"debt_to_equity":0.3,"fcf_yield":2.0,"sector":"Consumer Defensive"},
+    "NFLX":{"roic":22.0,"gross_margin":43.0,"debt_to_equity":0.9,"fcf_yield":3.1,"sector":"Communication Services"},
+    "AMD":{"roic":14.0,"gross_margin":47.0,"debt_to_equity":0.1,"fcf_yield":1.8,"sector":"Technology"},
+    "AVGO":{"roic":18.0,"gross_margin":64.0,"debt_to_equity":0.9,"fcf_yield":2.9,"sector":"Technology"},
+    "TSM":{"roic":20.0,"gross_margin":53.0,"debt_to_equity":0.5,"fcf_yield":3.5,"sector":"Technology"},
+    "ASML":{"roic":35.0,"gross_margin":52.0,"debt_to_equity":0.2,"fcf_yield":2.1,"sector":"Technology"},
+    "MU":{"roic":12.0,"gross_margin":35.0,"debt_to_equity":0.3,"fcf_yield":2.5,"sector":"Technology"},
+    "LRCX":{"roic":42.0,"gross_margin":47.0,"debt_to_equity":0.7,"fcf_yield":3.2,"sector":"Technology"},
+    "KLAC":{"roic":38.0,"gross_margin":61.0,"debt_to_equity":0.8,"fcf_yield":2.8,"sector":"Technology"},
+    "AMAT":{"roic":30.0,"gross_margin":47.0,"debt_to_equity":0.3,"fcf_yield":3.5,"sector":"Technology"},
+    "QCOM":{"roic":22.0,"gross_margin":55.0,"debt_to_equity":0.6,"fcf_yield":4.0,"sector":"Technology"},
+    "BRK.B":{"roic":12.0,"gross_margin":None,"debt_to_equity":0.3,"fcf_yield":5.0,"sector":"Financial Services"},
+    "UNH":{"roic":18.0,"gross_margin":25.0,"debt_to_equity":0.8,"fcf_yield":3.8,"sector":"Healthcare"},
+    "EOG":{"roic":16.0,"gross_margin":70.0,"debt_to_equity":0.2,"fcf_yield":6.0,"sector":"Energy"},
+    "CVX":{"roic":12.0,"gross_margin":40.0,"debt_to_equity":0.2,"fcf_yield":5.5,"sector":"Energy"},
+    "HD":{"roic":200.0,"gross_margin":33.5,"debt_to_equity":99.9,"fcf_yield":4.2,"sector":"Consumer Cyclical"},
+    "PEP":{"roic":15.0,"gross_margin":55.0,"debt_to_equity":2.1,"fcf_yield":4.0,"sector":"Consumer Defensive"},
+    "KO":{"roic":14.0,"gross_margin":60.0,"debt_to_equity":1.8,"fcf_yield":4.5,"sector":"Consumer Defensive"},
+    "AMGN":{"roic":22.0,"gross_margin":75.0,"debt_to_equity":4.5,"fcf_yield":5.0,"sector":"Healthcare"},
+    "MRK":{"roic":18.0,"gross_margin":72.0,"debt_to_equity":0.6,"fcf_yield":4.2,"sector":"Healthcare"},
+    "VZ":{"roic":7.0,"gross_margin":58.0,"debt_to_equity":2.0,"fcf_yield":5.5,"sector":"Communication Services"},
+    "IBM":{"roic":8.0,"gross_margin":55.0,"debt_to_equity":2.5,"fcf_yield":3.8,"sector":"Technology"},
+    "PAYX":{"roic":32.0,"gross_margin":72.0,"debt_to_equity":0.2,"fcf_yield":3.5,"sector":"Technology"},
+    "CRM":{"roic":8.0,"gross_margin":78.0,"debt_to_equity":0.2,"fcf_yield":3.0,"sector":"Technology"},
+    "ORCL":{"roic":60.0,"gross_margin":75.0,"debt_to_equity":5.0,"fcf_yield":4.0,"sector":"Technology"},
+    "ADSK":{"roic":22.0,"gross_margin":88.0,"debt_to_equity":0.8,"fcf_yield":3.0,"sector":"Technology"},
+    "NOVO":{"roic":55.0,"gross_margin":85.0,"debt_to_equity":0.1,"fcf_yield":3.0,"sector":"Healthcare"},
+    "AZN":{"roic":18.0,"gross_margin":82.0,"debt_to_equity":0.6,"fcf_yield":3.5,"sector":"Healthcare"},
+    "SHEL":{"roic":12.0,"gross_margin":25.0,"debt_to_equity":0.3,"fcf_yield":6.0,"sector":"Energy"},
+    "NESN":{"roic":15.0,"gross_margin":48.0,"debt_to_equity":0.7,"fcf_yield":4.5,"sector":"Consumer Defensive"},
+    "LVMH":{"roic":16.0,"gross_margin":68.0,"debt_to_equity":0.4,"fcf_yield":3.5,"sector":"Consumer Cyclical"},
+    "HSBC":{"roic":8.0,"gross_margin":None,"debt_to_equity":10.0,"fcf_yield":5.0,"sector":"Financial Services"},
+    "ROCHE":{"roic":20.0,"gross_margin":72.0,"debt_to_equity":0.5,"fcf_yield":4.0,"sector":"Healthcare"},
+    "SAMSUNG":{"roic":10.0,"gross_margin":38.0,"debt_to_equity":0.2,"fcf_yield":2.5,"sector":"Technology"},
+}
+
+def fetch_constituent_metrics(ticker: str) -> dict:
+    t = ticker.upper().strip()
+    now = time.time()
+    if t in _ETF_CONST_CACHE:
+        ts, data = _ETF_CONST_CACHE[t]
+        if now - ts < ETF_CONST_TTL: return data
+    if MOCK or not FMP_API_KEY:
+        data = MOCK_CONSTITUENT.get(t, {"roic":12.0,"gross_margin":45.0,"debt_to_equity":0.5,"fcf_yield":2.5,"sector":"Technology"})
+        _ETF_CONST_CACHE[t] = (now, data); return data
+    result = {"sector":"Unknown"}
+    try:
+        km = _fmp_get(f"key-metrics-ttm?symbol={t}&limit=1")
+        if km and isinstance(km, list) and km:
+            k = km[0]
+            result["roic"]           = (k.get("roicTTM") or 0) * 100
+            result["fcf_yield"]      = (k.get("freeCashFlowYieldTTM") or 0) * 100
+            result["debt_to_equity"] = k.get("debtToEquityTTM")
+    except Exception: pass
+    try:
+        inc = _fmp_get(f"income-statement?symbol={t}&limit=1")
+        if inc and isinstance(inc, list) and inc:
+            result["gross_margin"] = (inc[0].get("grossProfitRatio") or 0) * 100
+    except Exception: pass
+    try:
+        prof = _fmp_get(f"profile?symbol={t}")
+        if prof and isinstance(prof, list) and prof:
+            result["sector"] = prof[0].get("sector") or "Unknown"
+    except Exception: pass
+    _ETF_CONST_CACHE[t] = (now, result); return result
+
+def fetch_etf_wrapper_data(ticker: str) -> dict:
+    t = ticker.upper().strip()
+    if MOCK or not FMP_API_KEY:
+        mock = {
+            "VOO":  {"nav":695.20,"price":695.49,"expense_ratio":0.03,"benchmark":"S&P 500"},
+            "VTI":  {"nav":372.30,"price":372.54,"expense_ratio":0.03,"benchmark":"CRSP US Total Market"},
+            "QQQ":  {"nav":737.80,"price":738.31,"expense_ratio":0.20,"benchmark":"Nasdaq-100"},
+            "QQQM": {"nav":303.80,"price":303.96,"expense_ratio":0.15,"benchmark":"Nasdaq-100"},
+            "VGT":  {"nav":120.90,"price":121.06,"expense_ratio":0.10,"benchmark":"MSCI US IMI IT 25/50"},
+            "SMH":  {"nav":598.50,"price":598.93,"expense_ratio":0.35,"benchmark":"MVIS US Listed Semi 25"},
+            "SCHD": {"nav":32.48,"price":32.50,"expense_ratio":0.06,"benchmark":"Dow Jones US Dividend 100"},
+            "BND":  {"nav":73.42,"price":73.46,"expense_ratio":0.03,"benchmark":"Bloomberg US Aggregate"},
+            "VXUS": {"nav":86.02,"price":86.06,"expense_ratio":0.07,"benchmark":"FTSE Global All Cap ex US"},
+            "FNILX":{"nav":27.06,"price":27.07,"expense_ratio":0.00,"benchmark":"Fidelity US Large Cap"},
+            "SPAXX":{"nav":1.00, "price":1.00, "expense_ratio":0.42,"benchmark":"Money Market"},
+        }
+        return mock.get(t, {"nav":None,"price":None,"expense_ratio":None,"benchmark":"Unknown"})
+    result = {"nav":None,"price":None,"expense_ratio":None,"benchmark":"Unknown"}
+    try:
+        q = _fmp_get(f"quote?symbol={t}")
+        if q and isinstance(q, list) and q:
+            result["price"] = q[0].get("price"); result["nav"] = q[0].get("navPrice") or q[0].get("price")
+    except Exception: pass
+    try:
+        info = _fmp_get(f"etf-info?symbol={t}")
+        if info and isinstance(info, list) and info:
+            result["expense_ratio"] = info[0].get("expenseRatio"); result["benchmark"] = info[0].get("indexName") or "Unknown"
+    except Exception: pass
+    return result
+
+def compute_etf_weighted_metrics(holdings: list) -> dict:
+    total_w = sum(float(h.get("weightPercentage") or 0) for h in holdings)
+    if total_w == 0: return {}
+    w_roic = w_gm = w_fcf = w_de = de_w_total = 0.0
+    sectors = {}
+    for h in holdings:
+        raw_w = float(h.get("weightPercentage") or 0)
+        w = raw_w / total_w
+        metrics = h.get("_metrics") or {}
+        roic = metrics.get("roic"); gm = metrics.get("gross_margin")
+        fcf = metrics.get("fcf_yield"); de = metrics.get("debt_to_equity")
+        sect = metrics.get("sector") or "Unknown"
+        sectors[sect] = sectors.get(sect, 0) + raw_w
+        if roic is not None: w_roic += roic * w
+        if gm   is not None: w_gm   += gm   * w
+        if fcf  is not None: w_fcf  += fcf  * w  # negative FCF pulls score down
+        if de is not None and sect not in FINANCIAL_SECTORS:
+            w_de += de * raw_w; de_w_total += raw_w
+    return {
+        "weighted_roic": round(w_roic, 2),
+        "weighted_gm":   round(w_gm, 2),
+        "weighted_fcf":  round(w_fcf, 2),
+        "weighted_de":   round(w_de / de_w_total, 2) if de_w_total > 0 else None,
+        "sector_weights": dict(sorted(sectors.items(), key=lambda x: x[1], reverse=True)),
+        "constituents_used": len(holdings),
+        "weight_covered": round(total_w, 1),
+    }
+
+def run_etf_checks(wm: dict, wrapper: dict) -> dict:
+    roic = wm.get("weighted_roic"); gm = wm.get("weighted_gm")
+    fcf  = wm.get("weighted_fcf"); de = wm.get("weighted_de")
+    price = wrapper.get("price"); nav = wrapper.get("nav")
+    exp   = wrapper.get("expense_ratio")
+    nav_prem = round((price - nav) / nav * 100, 2) if price and nav and nav > 0 else None
+    fee_drag = round(exp / fcf * 100, 1) if exp is not None and fcf and fcf > 0 else None
+    checks = {
+        "roic": {"value": f"{roic:.1f}%" if roic else "N/A","status":"green" if roic and roic>=15 else "yellow" if roic and roic>=8 else "red","label":"Pass" if roic and roic>=15 else "Below threshold"},
+        "gross_margin": {"value": f"{gm:.1f}%" if gm else "N/A","status":"green" if gm and gm>=40 else "yellow" if gm and gm>=25 else "red","label":"Pricing Power" if gm and gm>=40 else "Average"},
+        "fcf_yield": {"value": f"{fcf:.1f}%" if fcf else "N/A","status":"green" if fcf and fcf>=3 else "yellow" if fcf and fcf>=1.5 else "red","label":"Adequate" if fcf and fcf>=3 else "Weak"},
+        "debt_to_equity": {"value": f"{de:.2f}x" if de else "N/A","status":"green" if de is not None and de<=1.0 else "yellow" if de and de<=2.0 else "red","label":"Low Leverage" if de and de<=1.0 else "Moderate"},
+        "nav_premium": {"value": f"{nav_prem:+.2f}%" if nav_prem is not None else "N/A","status":"green" if nav_prem is not None and nav_prem<=0.05 else "yellow" if nav_prem and nav_prem<=0.5 else "red","label":"At/Below NAV" if nav_prem is not None and nav_prem<=0.05 else f"{nav_prem:.2f}% premium" if nav_prem else "N/A"},
+        "fee_efficiency": {"value": f"{exp:.2f}%" if exp is not None else "N/A","status":"green" if fee_drag is not None and fee_drag<=5 else "yellow" if fee_drag and fee_drag<=20 else "red","label":"Negligible" if fee_drag is not None and fee_drag<=5 else f"Consumes {fee_drag:.0f}% of FCF" if fee_drag else "N/A"},
+    }
+    return {"checks": checks, "score": sum(1 for c in checks.values() if c["status"]=="green"), "total": 6, "nav_premium_pct": nav_prem, "fee_drag_pct": fee_drag}
+
+def classify_etf(wm: dict, bc: dict, ticker: str) -> dict:
+    t = ticker.upper()
+    if t in BOND_FUNDS:
+        return {"classification":"Robust","subtype":"Fixed Income","rationale":"Bond fund — equity metrics N/A. Serves as non-correlated portfolio anchor.","action":"HOLD as defensive anchor"}
+    sectors = wm.get("sector_weights",{})
+    top_s = max(sectors, key=sectors.get) if sectors else "Unknown"
+    top_pct = sectors.get(top_s, 0)
+    roic = wm.get("weighted_roic",0); gm = wm.get("weighted_gm",0); fcf = wm.get("weighted_fcf",0)
+    score = bc.get("score",0); nav_p = bc.get("nav_premium_pct")
+    af = []; fr = []
+    if roic >= 20: af.append(f"Weighted ROIC {roic:.0f}% — exceptional basket efficiency")
+    if gm >= 55:   af.append(f"Weighted gross margin {gm:.0f}% — strong pricing power")
+    if top_pct >= 50 and top_s in ("Technology","Communication Services"): af.append(f"{top_pct:.0f}% {top_s} — secular AI/digital tailwind")
+    if top_pct >= 70: fr.append(f"{top_pct:.0f}% concentration in {top_s} — sector tail risk")
+    if fcf < 1.5: fr.append(f"FCF yield {fcf:.1f}% — weak cash generation")
+    if nav_p and nav_p > 0.5: fr.append(f"Trading {nav_p:.1f}% above NAV — overpaying for wrapper")
+    if score >= 5 and len(af) >= 1 and len(fr) == 0:
+        return {"classification":"Anti-Fragile","subtype":f"{top_s}-focused","rationale":"; ".join(af),"action":"ACCUMULATE within target allocation","af_signals":af,"fr_signals":fr}
+    elif score >= 4 and len(fr) <= 1:
+        return {"classification":"Robust","subtype":"Diversified" if top_pct<50 else f"{top_s}-tilted","rationale":f"Solid basket. {fr[0] if fr else 'No major red flags.'}","action":"HOLD — core allocation","af_signals":af,"fr_signals":fr}
+    elif score <= 2 or len(fr) >= 2:
+        return {"classification":"Fragile","subtype":"Concentrated or Overvalued","rationale":"; ".join(fr[:2]),"action":"REDUCE — better vehicles available","af_signals":af,"fr_signals":fr}
+    else:
+        return {"classification":"Robust","subtype":"Mixed","rationale":f"Passes {score}/6 checks. Monitor {top_s} concentration.","action":"HOLD","af_signals":af,"fr_signals":fr}
+
+def analyze_etf_full(ticker: str) -> dict:
+    t = ticker.upper().strip()
+    holdings = fetch_etf_holdings(t)
+    if not holdings:
+        return {"error": f"No ETF data for {t}", "ticker": t, "type": "ETF"}
+    for h in holdings:
+        ct = h.get("asset") or h.get("symbol") or ""
+        if ct: h["_metrics"] = fetch_constituent_metrics(ct)
+    wm      = compute_etf_weighted_metrics(holdings)
+    wrapper = fetch_etf_wrapper_data(t)
+    bc      = run_etf_checks(wm, wrapper)
+    fc      = classify_etf(wm, bc, t)
+    nav_ok  = bc.get("nav_premium_pct") is None or bc["nav_premium_pct"] <= 0.5
+    score   = bc.get("score", 0)
+    if score >= 5 and nav_ok and fc["classification"] == "Anti-Fragile":   verdict = "VALUE STOCK"
+    elif score >= 4 and nav_ok:                                             verdict = "NEUTRAL"
+    elif score <= 2 or fc["classification"] == "Fragile":                  verdict = "VALUE TRAP"
+    else:                                                                   verdict = "NEUTRAL"
+    return {
+        "ticker": t, "type": "ETF",
+        "weighted_metrics": wm,
+        "wrapper": wrapper,
+        "etf_checks": bc,
+        "fragility": fc,
+        "verdict": verdict,
+        "top_holdings": [{"ticker":h.get("asset",""),"weight":h.get("weightPercentage",0),"roic":h.get("_metrics",{}).get("roic"),"sector":h.get("_metrics",{}).get("sector")} for h in holdings[:10]],
+        "overlap_tickers": [h.get("asset","") for h in holdings[:15]],
+        "generated_at": now_iso(),
+    }
+
+
 MOCK_DATA = {
     "ticker": "MOCK", "name": "Mock Co", "price": 100.0, "pe_ratio": 25.0,
     "fcf_yield": 2.5, "gross_margin": 50.0, "operating_margin": 20.0,
@@ -562,16 +841,26 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     rg  = m.get("revenue_growth") or 0
     om  = m.get("operating_margin") or 0
 
-    buffett_score = fc.get("buffett", {}).get("total_pass", 0)
-    dilution_flag = fc.get("dilution", {}).get("flag", "CLEAN")
-    dilution_pct  = fc.get("dilution", {}).get("dilution_pct") or 0
-    stage         = fc.get("stage", {}).get("stage", 2)
-    runway_years  = fc.get("cash_runway", {}).get("years")
-    cash          = fc.get("cash_runway", {}).get("cash") or 0
-    debt          = fc.get("buffett", {}).get("cash_gt_debt", {}).get("debt") or 0
-    retained_grow = fc.get("buffett", {}).get("retained_earnings_growing", {}).get("pass", False)
-    has_treasury  = fc.get("buffett", {}).get("treasury_stock", {}).get("pass", False)
-    preferred     = fc.get("buffett", {}).get("zero_preferred", {}).get("amount", 0)
+    # Support both old key structure and new forensics key structure
+    bs            = fc.get("buffett_score") or fc.get("buffett") or {}
+    buffett_score = bs.get("pass") or bs.get("total_pass") or 0
+    dil           = fc.get("dilution") or {}
+    dilution_flag = dil.get("status") or dil.get("flag") or "CLEAN"
+    dilution_pct  = float((dil.get("yoy_change") or "0%").replace("%","").replace("+","")) if isinstance(dil.get("yoy_change"), str) else (dil.get("dilution_pct") or 0)
+    stg           = fc.get("stage") or {}
+    stage_node    = stg.get("current_node") or ""
+    stage         = 1 if "Early" in stage_node else 2 if "Growth" in stage_node else 3 if "Mature" in stage_node else 4 if "Decline" in stage_node else 2
+    run           = fc.get("runway") or fc.get("cash_runway") or {}
+    runway_months = run.get("months")
+    runway_years  = (runway_months / 12) if runway_months else run.get("years")
+    cash          = run.get("cash") or 0
+    debt          = m.get("debt_to_equity", 0) or 0
+    # Retained earnings: check from EPS predictability trend as proxy
+    eps_check     = fc.get("eps_predictability") or {}
+    retained_grow = eps_check.get("status") == "green"
+    # Treasury: check dilution status (buyback = treasury stock present)
+    has_treasury  = dilution_flag in ("green", "BUYBACK", "CLEAN")
+    preferred     = 0  # Not separately tracked in new forensics
 
     # Is it optically "cheap"? (traditional value screen)
     optically_cheap = pe is not None and 0 < pe < 18
@@ -826,7 +1115,8 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         f"Financial metrics: {json.dumps(m)}. "
         f"Lifecycle phase: {phase}. Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
-        f" STEP 1 — IDENTIFY {t}'s ACTUAL BUSINESS MODEL before any analysis: "
+        f"{get_business_model_context(t)}"
+        f" STEP 1 — IF no ground truth provided above, identify {t}'s ACTUAL BUSINESS MODEL: "
         f"What does {t} actually sell? Who pays, how often, and for what? "
         f"Name the exact revenue model: SaaS per-merchant, SaaS per-seat, membership fee, transaction fee, advertising CPM, hardware+services, physical retail, etc. "
         f"Do NOT assume the business model — derive it from the company name and financial metrics provided. "
@@ -870,7 +1160,7 @@ def groq_analysis(t, m, phase, sig, forensics=None):
     r = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={"model": "llama-3.1-8b-instant",
+        json={"model": "llama-3.3-70b-versatile",
               "messages": [{"role": "user", "content": prompt}],
               "response_format": {"type": "json_object"}, "temperature": 0.2},
         timeout=30,
@@ -1030,6 +1320,99 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
     }
 
 
+
+# ─────────────────────────── Business model knowledge base ──────────────
+# Deterministic classification for common tickers.
+# Injected into AI prompt as ground truth to prevent hallucination.
+BUSINESS_MODEL_KB = {
+    # MEMBERSHIP models — Anti-fragile revenue
+    "COST":  {"model": "Membership warehouse retail ($65/year membership fee, 130M+ cardholders, 93% renewal rate)", "revenue_type": "membership", "physical": True,  "data_moat": "Robust"},
+    "AMZN":  {"model": "E-commerce marketplace + AWS compute + Prime membership", "revenue_type": "mixed_af", "physical": True,  "data_moat": "Anti-fragile"},
+    "NFLX":  {"model": "Consumer subscription streaming ($15-23/month, usage-agnostic)", "revenue_type": "membership", "physical": False, "data_moat": "Robust"},
+
+    # USAGE-BASED compute — Anti-fragile (AI increases usage)
+    "NVDA":  {"model": "Hardware (GPUs) + CUDA software stack sold per unit", "revenue_type": "hardware_usage", "physical": True,  "data_moat": "Anti-fragile"},
+    "SNOW":  {"model": "Usage-based cloud data platform (charges per compute credit consumed)", "revenue_type": "usage_based", "physical": False, "data_moat": "Robust"},
+    "MDB":   {"model": "Usage-based database (Atlas consumption model)", "revenue_type": "usage_based", "physical": False, "data_moat": "Robust"},
+
+    # TRANSACTION FEE infrastructure — Robust to Anti-fragile
+    "V":     {"model": "Transaction fee network (basis points on every card swipe)", "revenue_type": "transaction", "physical": False, "data_moat": "Anti-fragile"},
+    "MA":    {"model": "Transaction fee network (basis points on every card swipe)", "revenue_type": "transaction", "physical": False, "data_moat": "Anti-fragile"},
+    "PYPL":  {"model": "Transaction fee payments platform (% per transaction)", "revenue_type": "transaction", "physical": False, "data_moat": "Robust"},
+    "COIN":  {"model": "Transaction fee crypto exchange (% per trade)", "revenue_type": "transaction", "physical": False, "data_moat": "Robust"},
+
+    # PER-SEAT SaaS — Fragile (AI reduces headcount = fewer seats)
+    "CRM":   {"model": "Per-seat CRM SaaS ($25-$300/user/month, Salesforce charges per human user)", "revenue_type": "per_seat", "physical": False, "data_moat": "Robust"},
+    "SHOP":  {"model": "Per-merchant SaaS platform ($29-$299/month per merchant store)", "revenue_type": "per_merchant", "physical": False, "data_moat": "Robust"},
+    "NOW":   {"model": "Per-seat enterprise workflow SaaS (ServiceNow charges per employee)", "revenue_type": "per_seat", "physical": False, "data_moat": "Robust"},
+    "WDAY":  {"model": "Per-seat HR/Finance SaaS (Workday charges per employee record)", "revenue_type": "per_seat", "physical": False, "data_moat": "Robust"},
+    "HUBS":  {"model": "Per-seat marketing/CRM SaaS (HubSpot charges per marketing seat)", "revenue_type": "per_seat", "physical": False, "data_moat": "Robust"},
+    "PLTR":  {"model": "Enterprise software contracts (AIP platform, large government/commercial deals)", "revenue_type": "enterprise_contract", "physical": False, "data_moat": "Anti-fragile"},
+
+    # PHYSICAL hardware + ecosystem — Anti-fragile integration
+    "AAPL":  {"model": "Hardware (iPhone/Mac) + App Store + Services ecosystem", "revenue_type": "hardware_ecosystem", "physical": True,  "data_moat": "Anti-fragile"},
+    "MSFT":  {"model": "Mixed: Azure usage-based cloud + Office 365 per-seat + Xbox + LinkedIn", "revenue_type": "mixed_robust", "physical": False, "data_moat": "Anti-fragile"},
+    "AXON":  {"model": "Hardware (Taser/body cameras) + SaaS Evidence.com subscription", "revenue_type": "hardware_saas", "physical": True,  "data_moat": "Anti-fragile"},
+    "DE":    {"model": "Agricultural/construction equipment sales + precision ag software", "revenue_type": "hardware_saas", "physical": True,  "data_moat": "Anti-fragile"},
+
+    # ADVERTISING — Robust (brand-dependent)
+    "GOOG":  {"model": "Advertising CPM/CPC (Search + YouTube) + Google Cloud usage-based", "revenue_type": "advertising_mixed", "physical": False, "data_moat": "Anti-fragile"},
+    "META":  {"model": "Advertising CPM (Facebook/Instagram/WhatsApp)", "revenue_type": "advertising", "physical": False, "data_moat": "Anti-fragile"},
+
+    # PHYSICAL RETAIL — Anti-fragile integration
+    "WMT":   {"model": "Physical retail + Walmart+ membership + advertising", "revenue_type": "physical_retail", "physical": True,  "data_moat": "Robust"},
+    "TGT":   {"model": "Physical retail (discount department store)", "revenue_type": "physical_retail", "physical": True,  "data_moat": "Robust"},
+    "HD":    {"model": "Physical home improvement retail (no membership)", "revenue_type": "physical_retail", "physical": True,  "data_moat": "Robust"},
+
+    # SPECULATIVE / HIGH DILUTION
+    "TSLA":  {"model": "EV hardware sales + FSD software + Energy storage", "revenue_type": "hardware_saas", "physical": True,  "data_moat": "Robust"},
+    "RKLB":  {"model": "Rocket launch services (per-launch contracts) + space systems", "revenue_type": "per_contract", "physical": True,  "data_moat": "Robust"},
+    "SOUN":  {"model": "Per-seat voice AI SaaS (charges per deployment/enterprise contract)", "revenue_type": "per_seat", "physical": False, "data_moat": "Fragile"},
+    "COIN":  {"model": "Transaction fee crypto exchange (% per trade)", "revenue_type": "transaction", "physical": False, "data_moat": "Robust"},
+}
+
+def get_business_model_context(ticker: str) -> str:
+    """Returns a deterministic business model description for known tickers.
+    Injected into AI prompt as ground truth to prevent hallucination."""
+    kb = BUSINESS_MODEL_KB.get(ticker.upper())
+    if not kb:
+        return ""
+
+    rt = kb["revenue_type"]
+    rev_guidance = {
+        "membership":        "ANTI-FRAGILE — usage-agnostic recurring fee, inflation-resistant, not headcount-dependent",
+        "usage_based":       "ANTI-FRAGILE — AI increases compute usage, charges scale with activity",
+        "hardware_usage":    "ANTI-FRAGILE — physical hardware + CUDA lock-in, AI tailwind",
+        "hardware_ecosystem":"ANTI-FRAGILE — physical device + proprietary OS + ecosystem lock-in",
+        "hardware_saas":     "ROBUST — physical hardware creates switching costs, SaaS layer adds recurring revenue",
+        "transaction":       "ROBUST to ANTI-FRAGILE — takes % of every transaction, volume grows with economy",
+        "per_seat":          "FRAGILE — charges per human worker/user, AI reduces headcount = fewer seats",
+        "per_merchant":      "FRAGILE — charges per merchant, AI tools help merchants consolidate = fewer merchants",
+        "enterprise_contract":"ROBUST — large multi-year government contracts, high switching costs",
+        "advertising":       "ROBUST — CPM revenue, brand loyalty determines durability",
+        "advertising_mixed": "ROBUST to ANTI-FRAGILE — advertising + cloud usage both growing with AI",
+        "physical_retail":   "ROBUST — physical store infrastructure, brand loyalty, cannot be fully replaced by software",
+        "mixed_af":          "ROBUST to ANTI-FRAGILE — multiple revenue streams with physical and usage components",
+        "mixed_robust":      "ROBUST — diversified revenue across seat-based and usage-based",
+        "per_contract":      "ROBUST — large contracts with high barriers to entry",
+    }.get(rt, "ASSESS based on company fundamentals")
+
+    physical_note = (
+        "ANTI-FRAGILE on Physical Integration — company operates physical infrastructure that cannot be replicated by software alone"
+        if kb["physical"] else
+        "FRAGILE on Physical Integration — pure software/digital company with no owned physical infrastructure"
+    )
+
+    return (
+        f"\n\nGROUND TRUTH FOR {ticker.upper()} — DO NOT CONTRADICT THESE FACTS:\n"
+        f"Revenue Model: {kb['model']}\n"
+        f"Revenue Model Moat Rating: {rev_guidance}\n"
+        f"Physical Integration: {physical_note}\n"
+        f"Data Gravity baseline: {kb['data_moat']} (adjust based on proprietary data depth)\n"
+        f"These are established facts. Base your reasoning on these, not assumptions."
+    )
+
+
 DISCLAIMER = ("PhaseLens is an educational research tool — not a licensed financial advisor, "
               "broker, or consultant. Signals are generated automatically by a rules-based model "
               "from public data and may be inaccurate or outdated. Nothing here is financial advice "
@@ -1051,6 +1434,15 @@ def api_stock(ticker: str):
 @app.get("/api/analyze/{ticker}")
 def api_analyze(ticker: str, visitor_id: str = "", email: str = ""):
     t = ticker.upper().strip()
+    # Route ETFs to look-through engine
+    if is_etf(t):
+        cached = _analysis_cache.get(t)
+        if cached and cached[0] > time.time():
+            return cached[1]
+        etf_result = analyze_etf_full(t)
+        _analysis_cache[t] = (time.time() + ETF_HOLDINGS_TTL, etf_result)
+        return etf_result
+    # Stock analysis path
     hit = _analysis_cache.get(t)
     if hit and hit[0] > time.time():
         return hit[1]
