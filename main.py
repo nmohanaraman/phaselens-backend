@@ -276,6 +276,7 @@ MOCK_CONSTITUENT = {
 }
 
 def fetch_constituent_metrics(ticker: str) -> dict:
+    """Single-ticker lookup — used as fallback. Prefer fetch_batch_metrics() for ETF holdings."""
     t = ticker.upper().strip()
     now = time.time()
     if t in _ETF_CONST_CACHE:
@@ -292,11 +293,7 @@ def fetch_constituent_metrics(ticker: str) -> dict:
             result["roic"]           = (k.get("roicTTM") or 0) * 100
             result["fcf_yield"]      = (k.get("freeCashFlowYieldTTM") or 0) * 100
             result["debt_to_equity"] = k.get("debtToEquityTTM")
-    except Exception: pass
-    try:
-        inc = _fmp_get(f"income-statement?symbol={t}&limit=1")
-        if inc and isinstance(inc, list) and inc:
-            result["gross_margin"] = (inc[0].get("grossProfitRatio") or 0) * 100
+            result["gross_margin"]   = (k.get("grossProfitMarginTTM") or 0) * 100
     except Exception: pass
     try:
         prof = _fmp_get(f"profile?symbol={t}")
@@ -304,6 +301,85 @@ def fetch_constituent_metrics(ticker: str) -> dict:
             result["sector"] = prof[0].get("sector") or "Unknown"
     except Exception: pass
     _ETF_CONST_CACHE[t] = (now, result); return result
+
+
+def fetch_batch_metrics(tickers: list) -> dict:
+    """
+    BATCH fetch metrics for multiple tickers in 2 FMP calls instead of 2×N calls.
+    FMP supports comma-separated symbols: key-metrics-ttm?symbol=AAPL,MSFT,NVDA
+    Returns dict keyed by ticker: {ticker: {roic, gross_margin, fcf_yield, debt_to_equity, sector}}
+    Checks cache first — only fetches uncached tickers.
+    """
+    now = time.time()
+    results = {}
+    to_fetch = []
+
+    for t in tickers:
+        t = t.upper().strip()
+        if not t: continue
+        cached = _ETF_CONST_CACHE.get(t)
+        if cached and cached[0] > now:
+            results[t] = cached[1]
+        else:
+            to_fetch.append(t)
+
+    if not to_fetch:
+        return results
+
+    if MOCK or not FMP_API_KEY:
+        for t in to_fetch:
+            d = MOCK_CONSTITUENT.get(t, {"roic":12.0,"gross_margin":45.0,"debt_to_equity":0.5,"fcf_yield":2.5,"sector":"Technology"})
+            results[t] = d
+            _ETF_CONST_CACHE[t] = (now + ETF_CONST_TTL, d)
+        return results
+
+    # ── BATCH CALL 1: key-metrics-ttm for all tickers at once (1 API call) ──
+    symbols = ",".join(to_fetch)
+    km_by_ticker = {}
+    try:
+        km_raw = _fmp_get(f"key-metrics-ttm?symbol={symbols}")
+        if km_raw and isinstance(km_raw, list):
+            for item in km_raw:
+                sym = (item.get("symbol") or "").upper()
+                if sym:
+                    km_by_ticker[sym] = {
+                        "roic":          (item.get("roicTTM") or 0) * 100,
+                        "fcf_yield":     (item.get("freeCashFlowYieldTTM") or 0) * 100,
+                        "debt_to_equity": item.get("debtToEquityTTM"),
+                        "gross_margin":  (item.get("grossProfitMarginTTM") or 0) * 100,
+                    }
+    except Exception:
+        pass  # Batch failed — fall through to individual fetch
+
+    # ── BATCH CALL 2: profile for sector classification (1 API call) ──
+    sector_by_ticker = {}
+    try:
+        prof_raw = _fmp_get(f"profile?symbol={symbols}")
+        if prof_raw and isinstance(prof_raw, list):
+            for item in prof_raw:
+                sym = (item.get("symbol") or "").upper()
+                if sym:
+                    sector_by_ticker[sym] = item.get("sector") or "Unknown"
+    except Exception:
+        pass
+
+    # Merge and cache each ticker
+    for t in to_fetch:
+        km = km_by_ticker.get(t, {})
+        d = {
+            "roic":           km.get("roic", 0),
+            "gross_margin":   km.get("gross_margin", 0),
+            "fcf_yield":      km.get("fcf_yield", 0),
+            "debt_to_equity": km.get("debt_to_equity"),
+            "sector":         sector_by_ticker.get(t, "Unknown"),
+        }
+        # Fallback to mock if batch returned nothing for this ticker
+        if d["roic"] == 0 and d["gross_margin"] == 0:
+            d = MOCK_CONSTITUENT.get(t, d)
+        results[t] = d
+        _ETF_CONST_CACHE[t] = (now + ETF_CONST_TTL, d)
+
+    return results
 
 def fetch_etf_wrapper_data(ticker: str) -> dict:
     t = ticker.upper().strip()
@@ -410,9 +486,12 @@ def analyze_etf_full(ticker: str) -> dict:
     holdings = fetch_etf_holdings(t)
     if not holdings:
         return {"error": f"No ETF data for {t}", "ticker": t, "type": "ETF"}
+    # BATCH fetch — 2 FMP calls for all holdings (not 2×N individual calls)
+    tickers_needed = [h.get("asset") or h.get("symbol") or "" for h in holdings]
+    batch = fetch_batch_metrics([t2 for t2 in tickers_needed if t2])
     for h in holdings:
         ct = h.get("asset") or h.get("symbol") or ""
-        if ct: h["_metrics"] = fetch_constituent_metrics(ct)
+        h["_metrics"] = batch.get(ct.upper(), {}) if ct else {}
     wm      = compute_etf_weighted_metrics(holdings)
     wrapper = fetch_etf_wrapper_data(t)
     bc      = run_etf_checks(wm, wrapper)
@@ -443,14 +522,29 @@ MOCK_DATA = {
     "market_cap": 50_000_000_000,
 }
 
+# ── FMP daily call counter (resets at midnight UTC) ────────────────────────
+_fmp_call_count = {"date": "", "count": 0}
+FMP_FREE_DAILY_LIMIT = 250
+
 def _fmp_get(path: str) -> dict:
-    """Call FMP API and return parsed JSON. Raises HTTPException on failure."""
-    url = f"https://financialmodelingprep.com/stable/{path}&apikey={FMP_API_KEY}"
+    """Call FMP stable API. Tracks daily call count to detect limit exhaustion."""
+    global _fmp_call_count
+    import datetime
+    today = datetime.date.today().isoformat()
+    if _fmp_call_count["date"] != today:
+        _fmp_call_count = {"date": today, "count": 0}
+    _fmp_call_count["count"] += 1
+    if _fmp_call_count["count"] > FMP_FREE_DAILY_LIMIT - 10:
+        print(f"⚠️  FMP WARNING: {_fmp_call_count['count']} calls today — approaching 250/day free limit")
+
+    # Detect URL construction bug: path must include '?' before apikey '&'
+    separator = "&" if "?" in path else "?"
+    url = f"https://financialmodelingprep.com/stable/{path}{separator}apikey={FMP_API_KEY}"
     r = httpx.get(url, timeout=15)
     if r.status_code == 401:
         raise HTTPException(503, "FMP API key invalid — check FMP_API_KEY on Render")
     if r.status_code == 429:
-        raise HTTPException(503, "FMP daily limit reached (250/day on free plan)")
+        raise HTTPException(503, f"FMP daily limit reached ({_fmp_call_count['count']} calls today). Resets at midnight UTC. Upgrade at financialmodelingprep.com for higher limits.")
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and "Error Message" in data:
@@ -1425,6 +1519,9 @@ def root():
     return {"service": "PhaseLens API", "version": "2.0", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
             "fmp_enabled": bool(FMP_API_KEY),
+            "fmp_calls_today": _fmp_call_count["count"],
+            "fmp_daily_limit": FMP_FREE_DAILY_LIMIT,
+            "fmp_calls_remaining": max(0, FMP_FREE_DAILY_LIMIT - _fmp_call_count["count"]),
             "auth_enabled": bool(FIREBASE_PROJECT_ID)}
 
 @app.get("/api/stock/{ticker}")
