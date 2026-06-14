@@ -182,17 +182,9 @@ BOND_FUNDS = {"BND","BNDX","AGG","TLT","IEF","SHY","LQD","HYG","SPAXX","VMFXX","
 FINANCIAL_SECTORS = {"Financial Services","Financials","Banking","Insurance","Financial"}
 
 def is_etf(ticker: str) -> bool:
+    """Check if ticker is a known ETF. Static set only — no FMP calls wasted."""
     t = ticker.upper().strip()
-    if t in KNOWN_ETFS or t in BOND_FUNDS:
-        return True
-    if FMP_API_KEY and not MOCK:
-        try:
-            info = _fmp_get(f"etf-info?symbol={t}")
-            if info and isinstance(info, list) and info:
-                return True
-        except Exception:
-            pass
-    return False
+    return t in KNOWN_ETFS or t in BOND_FUNDS
 
 def fetch_etf_holdings(ticker: str) -> list:
     t = ticker.upper().strip()
@@ -940,7 +932,14 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     buffett_score = bs.get("pass") or bs.get("total_pass") or 0
     dil           = fc.get("dilution") or {}
     dilution_flag = dil.get("status") or dil.get("flag") or "CLEAN"
-    dilution_pct  = float((dil.get("yoy_change") or "0%").replace("%","").replace("+","")) if isinstance(dil.get("yoy_change"), str) else (dil.get("dilution_pct") or 0)
+    dilution_pct  = 0
+    _dil_raw = dil.get("yoy_change") or dil.get("dilution_pct") or 0
+    if isinstance(_dil_raw, str):
+        _dil_clean = _dil_raw.replace("%","").replace("+","").strip()
+        try:
+            dilution_pct = float(_dil_clean)
+        except (ValueError, TypeError):
+            dilution_pct = 0
     stg           = fc.get("stage") or {}
     stage_node    = stg.get("current_node") or ""
     stage         = 1 if "Early" in stage_node else 2 if "Growth" in stage_node else 3 if "Mature" in stage_node else 4 if "Decline" in stage_node else 2
@@ -1514,6 +1513,31 @@ DISCLAIMER = ("PhaseLens is an educational research tool — not a licensed fina
               "licensed financial professional before investing.")
 
 # ─────────────────────────── Public endpoints ───────────────────────────────
+@app.get("/api/debug/{ticker}")
+def debug_ticker(ticker: str):
+    """Debug: shows raw FMP response for a ticker. Use to diagnose live data issues."""
+    t = ticker.upper().strip()
+    result = {"ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK, "fmp_enabled": bool(FMP_API_KEY)}
+    if MOCK:
+        result["note"] = "Running in MOCK mode — no live FMP data"
+        return result
+    if not FMP_API_KEY:
+        result["note"] = "FMP_API_KEY not set — no live data possible"
+        return result
+    try:
+        quote = _fmp_get(f"quote?symbol={t}")
+        result["raw_quote"] = quote[0] if quote and isinstance(quote, list) else quote
+        result["extracted_price"] = quote[0].get("price") if quote and isinstance(quote, list) else None
+    except Exception as e:
+        result["quote_error"] = str(e)
+    try:
+        km = _fmp_get(f"key-metrics-ttm?symbol={t}&limit=1")
+        result["raw_key_metrics"] = km[0] if km and isinstance(km, list) else km
+    except Exception as e:
+        result["key_metrics_error"] = str(e)
+    result["fmp_calls_today"] = _fmp_call_count["count"]
+    return result
+
 @app.get("/")
 def root():
     return {"service": "PhaseLens API", "version": "2.0", "status": "ok",
@@ -1531,6 +1555,26 @@ def api_stock(ticker: str):
 @app.get("/api/analyze/{ticker}")
 def api_analyze(ticker: str, visitor_id: str = "", email: str = ""):
     t = ticker.upper().strip()
+    try:
+        return _api_analyze_inner(t, visitor_id, email)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        print(f"❌ UNHANDLED ERROR analyzing {t}: {exc}")
+        traceback.print_exc()
+        return {
+            "ticker": t, "name": t, "price": 0,
+            "score": 50, "recommendation": "HOLD",
+            "phase": "UNKNOWN", "phaseSignals": [],
+            "error": f"Analysis error: {str(exc)[:200]}",
+            "signalDrivers": [],
+            "forensics": {}, "moatAssessment": {},
+            "verdictCard": {"section1":{"classification":"NOT APPLICABLE","market_action_profile":"ERROR","confidence":"NONE","value_score":0,"trap_score":0},"section2":{"reasoning":f"Analysis failed: {str(exc)[:100]}","supporting":[],"red_flags":[]},"section3":{"text":"Retry. If error persists, check /api/debug/"+t},"section4":{"text":"DYOR."}},
+            "complianceShield": "DYOR — analysis error. Not financial advice.",
+        }
+
+def _api_analyze_inner(t: str, visitor_id: str = "", email: str = ""):
     # Route ETFs to look-through engine
     if is_etf(t):
         cached = _analysis_cache.get(t)
