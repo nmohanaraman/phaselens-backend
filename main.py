@@ -770,6 +770,38 @@ def compute_signal_with_forensics(m: dict, phase: str, forensics: dict) -> dict:
     rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
     return {"score": score, "recommendation": rec, "drivers": drivers}
 
+# ─────────────────────────── Moat quality signal adjustment ────────────────
+def apply_moat_penalty(sig: dict, moat_assessment: dict) -> dict:
+    """Post-AI score adjustment: Fragile moat reduces conviction, Anti-fragile adds premium."""
+    if not moat_assessment:
+        return sig
+    ratings = [
+        moat_assessment.get("liability", {}).get("rating", ""),
+        moat_assessment.get("businessModel", {}).get("rating", ""),
+        moat_assessment.get("physicalIntegration", {}).get("rating", ""),
+        moat_assessment.get("dataGravity", {}).get("rating", ""),
+    ]
+    fragile_count = sum(1 for r in ratings if "Fragile" in r and "Anti" not in r)
+    antifrag_count = sum(1 for r in ratings if "Anti" in r)
+
+    score = sig["score"]
+    drivers = list(sig["drivers"])
+
+    if fragile_count >= 3:
+        score -= 8
+        drivers.append(f"-8: Structurally Fragile moat ({fragile_count}/4 lenses) — high disruption risk")
+    elif fragile_count == 2:
+        score -= 4
+        drivers.append(f"-4: Partially Fragile moat ({fragile_count}/4 lenses) — structural vulnerability")
+    if antifrag_count >= 3:
+        score += 5
+        drivers.append(f"+5: Anti-fragile moat ({antifrag_count}/4 lenses) — structural durability premium")
+
+    score = max(0, min(100, score))
+    rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
+    return {"score": score, "recommendation": rec, "drivers": drivers}
+
+
 # ─────────────────────────── AI analysis (Groq, optional) ──────────────────
 def groq_analysis(t, m, phase, sig, forensics=None):
     forensics_ctx = ""
@@ -794,39 +826,46 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         f"Financial metrics: {json.dumps(m)}. "
         f"Lifecycle phase: {phase}. Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
-        f" QUALITATIVE MOAT ASSESSMENT — evaluate these 4 structural lenses. Rate each strictly as Anti-fragile, Robust, or Fragile. "
-        f"Use the ACTUAL business model of {t}, not assumptions from another industry. "
+        f" STEP 1 — IDENTIFY {t}'s ACTUAL BUSINESS MODEL before any analysis: "
+        f"What does {t} actually sell? Who pays, how often, and for what? "
+        f"Name the exact revenue model: SaaS per-merchant, SaaS per-seat, membership fee, transaction fee, advertising CPM, hardware+services, physical retail, etc. "
+        f"Do NOT assume the business model — derive it from the company name and financial metrics provided. "
 
-        f"LENS 1 — COST OF FAILURE (Liability): "
-        f"For SOFTWARE companies: would a 90% AI accuracy rate cause catastrophic legal/operational damage? "
-        f"For PHYSICAL RETAIL, HEALTHCARE, MANUFACTURING companies: would a supply chain failure, product recall, or service disruption be catastrophic and unrecoverable? "
-        f"Anti-fragile = errors cause permanent brand damage or legal liability (FDA trials, financial fraud). Fragile = errors are minor and easily fixed (marketing copy). "
+        f" STEP 2 — QUALITATIVE MOAT ASSESSMENT using 4 lenses. Rate each Anti-fragile, Robust, or Fragile. "
+        f"Every rating MUST cite specific facts about {t}, not generic statements. "
 
-        f"LENS 2 — BUSINESS MODEL (Revenue Structure): "
-        f"CRITICAL DEFINITIONS: "
-        f"'Seat-based' means charging PER HUMAN EMPLOYEE or PER USER LICENSE (like Salesforce, Workday, Microsoft Office). This IS Fragile because AI reduces headcount. "
-        f"'Membership subscription' (like Costco $65/year, Netflix) is NOT seat-based — it is ANTI-FRAGILE because it is recurring, inflation-resistant, and usage-agnostic. "
-        f"'Usage-based' (like AWS per-compute) = Anti-fragile as AI increases usage. "
-        f"'Transaction-based' (retail, restaurants) = Robust to Fragile depending on brand loyalty. "
-        f"Correctly identify which category {t} belongs to before rating. "
+        f"LENS 1 — COST OF FAILURE: If {t}'s core product fails or makes errors, is the consequence catastrophic and unrecoverable? "
+        f"Anti-fragile: FDA drug trial software errors = regulatory shutdown. Financial fraud detection failures = lawsuits. Healthcare diagnosis errors = deaths. "
+        f"Robust: E-commerce platform outage = revenue loss but recoverable. Payment processing errors = chargeable. "
+        f"Fragile: Marketing copy errors = minor, easily corrected. Content recommendation errors = user ignores it. "
 
-        f"LENS 3 — PHYSICAL WORLD INTEGRATION (Atoms vs Bits): "
-        f"Does the company REQUIRE physical infrastructure that cannot be replaced by software? "
-        f"Anti-fragile examples: warehouse retail (Costco), hospitals, manufacturing, logistics hubs, body cameras. "
-        f"Fragile examples: pure SaaS, content platforms, digital marketplaces with no physical component. "
+        f"LENS 2 — BUSINESS MODEL (AI disruption vulnerability): "
+        f"CRITICAL — use ONLY these definitions: "
+        f"Anti-fragile: MEMBERSHIP fees (Costco $65/yr, Amazon Prime) = usage-agnostic, inflation-resistant. USAGE-BASED compute (AWS, Snowflake) = AI increases usage. TRANSACTION FEES on indispensable infrastructure (Visa, Stripe). "
+        f"Robust: ADVERTISING revenue with strong brand loyalty. PROPRIETARY HARDWARE + software bundles. SUBSCRIPTION with high switching costs (Bloomberg Terminal). "
+        f"Fragile: PER-SEAT SaaS licenses (per employee/user) — AI directly reduces headcount = fewer seats. Examples: Salesforce CRM per user, Workday per employee, Shopify per merchant if merchants use AI to consolidate. COMMODITY SaaS with easy substitutes. "
+        f"IMPORTANT: Do NOT call membership/subscription models 'seat-based'. Seat-based specifically means charging per human worker. "
 
-        f"LENS 4 — NETWORK / DATA GRAVITY: "
-        f"Does the company possess proprietary data or network effects that public LLMs cannot access or replicate? "
-        f"Anti-fragile: member purchase histories (Costco 130M+ cardholders), proprietary financial data, clinical trial data. "
-        f"Fragile: generic content, easily scraped web data, no switching costs. "
+        f"LENS 3 — PHYSICAL WORLD INTEGRATION: Does {t} require physical infrastructure impossible to replace with software alone? "
+        f"Anti-fragile: Physical warehouses + cold chain (Costco, Amazon). Hospital buildings + medical equipment. Manufacturing plants. Satellite/cell tower networks. Body cameras + evidence management. "
+        f"Fragile: Pure software/SaaS companies. Digital content platforms. E-commerce platforms with no owned logistics. App marketplaces. "
+
+        f"LENS 4 — DATA GRAVITY: Does {t} have proprietary data that creates switching costs and cannot be replicated by public LLMs? "
+        f"Anti-fragile: Member transaction histories at scale (130M+ Costco cardholders). Proprietary medical records. Real-time financial market data. Clinical trial databases. "
+        f"Robust: Large merchant/seller ecosystems with historical order data. Brand-specific behavioral data. Multi-year customer relationship history. "
+        f"Fragile: Generic website analytics. Easily scraped product data. No unique data assets. "
 
         f" Return ONLY JSON with these exact keys: "
-        '{"summary":str(3-4 sentences covering financial health AND moat assessment with company-specific evidence),'
-        '"phaseRationale":str(why this lifecycle phase based on operating income trajectory),'
-        '"strengths":[3 strings with specific quantitative data points],'
-        '"risks":[3 strings with specific data points],'
-        '"moatAssessment":{"liability":{"rating":str,"reasoning":str(2 sentences, company-specific)},"businessModel":{"rating":str,"reasoning":str(2 sentences, name the specific revenue model type)},"physicalIntegration":{"rating":str,"reasoning":str(2 sentences, name the physical assets)},"dataGravity":{"rating":str,"reasoning":str(2 sentences, name the specific data advantage)}},'
-        '"mgmtNote":str(1 sentence on capital allocation discipline)}'
+        '{"summary":str(3-4 sentences: financial health + actual moat quality + investment implication),'
+        '"phaseRationale":str(lifecycle phase reasoning from operating income and revenue trajectory),'
+        '"strengths":[3 strings with specific data points unique to this company],'
+        '"risks":[3 strings with specific risks unique to this company],'
+        '"moatAssessment":{'
+        '"liability":{"rating":str(Anti-fragile|Robust|Fragile),"reasoning":str(2 sentences citing specific product/service failure scenario for THIS company)},'
+        '"businessModel":{"rating":str(Anti-fragile|Robust|Fragile),"reasoning":str(2 sentences: name the exact revenue model type and why it is or is not vulnerable to AI headcount reduction)},'
+        '"physicalIntegration":{"rating":str(Anti-fragile|Robust|Fragile),"reasoning":str(2 sentences: name the physical assets owned OR confirm pure-software status)},'
+        '"dataGravity":{"rating":str(Anti-fragile|Robust|Fragile),"reasoning":str(2 sentences: name the specific proprietary data assets or lack thereof)}},'
+        '"mgmtNote":str(1 sentence on capital allocation discipline based on the financial data)}'
     )
     r = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -1027,6 +1066,10 @@ def api_analyze(ticker: str, visitor_id: str = "", email: str = ""):
             ai = fallback_analysis(t, m, ph["phase"], sig, forensics)
     else:
         ai = fallback_analysis(t, m, ph["phase"], sig, forensics)
+    # Adjust score based on moat quality: Fragile moat lowers conviction, Anti-fragile adds premium
+    moat_data = ai.get("moatAssessment")
+    if moat_data:
+        sig = apply_moat_penalty(sig, moat_data)
     value_verdict = compute_value_verdict(m, forensics, ph["phase"])
     verdict_card  = format_verdict_card(sig, value_verdict, m)
     payload = {
