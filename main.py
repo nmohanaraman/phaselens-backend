@@ -494,8 +494,20 @@ def analyze_etf_full(ticker: str) -> dict:
     elif score >= 4 and nav_ok:                                             verdict = "NEUTRAL"
     elif score <= 2 or fc["classification"] == "Fragile":                  verdict = "VALUE TRAP"
     else:                                                                   verdict = "NEUTRAL"
+    # Top-level fields mirror stock response shape so ANY frontend version renders correctly
+    _etf_price = wrapper.get("price") if wrapper else None
+    _etf_score = round(score / (bc.get("total", 6) or 6) * 100) if bc else 50
+    _action = (fc.get("action") or "")
+    _etf_rec = "BUY" if "ACCUMULATE" in _action else ("SELL" if ("REDUCE" in _action or "EXIT" in _action) else "HOLD")
     return {
         "ticker": t, "type": "ETF",
+        "name": t,
+        "price": _etf_price,
+        "score": _etf_score,
+        "recommendation": _etf_rec,
+        "phase": fc.get("classification", "ETF") if fc else "ETF",
+        "summary": fc.get("rationale", "") if fc else "",
+        "phaseRationale": fc.get("rationale", "") if fc else "",
         "weighted_metrics": wm,
         "wrapper": wrapper,
         "etf_checks": bc,
