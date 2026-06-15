@@ -216,6 +216,26 @@ def is_etf(ticker: str) -> bool:
     t = ticker.upper().strip()
     return t in KNOWN_ETFS or t in BOND_FUNDS
 
+
+# Ticker aliases: FMP only carries certain share classes / formats.
+# GOOG (class C) → GOOGL (class A, the one FMP has). Berkshire uses dashes.
+FMP_TICKER_ALIASES = {
+    "GOOG": "GOOGL",
+    "BRK.B": "BRK-B", "BRKB": "BRK-B", "BRK.A": "BRK-A",
+    "BF.B": "BF-B", "BF.A": "BF-A",
+    "HEI.A": "HEI-A", "LEN.B": "LEN-B",
+}
+
+def _normalize_fmp_ticker(ticker: str) -> str:
+    """Map common ticker formats to what FMP expects (avoids 402 errors)."""
+    t = ticker.upper().strip()
+    if t in FMP_TICKER_ALIASES:
+        return FMP_TICKER_ALIASES[t]
+    # Dotted class shares → dash form (BRK.B → BRK-B) which FMP accepts
+    if "." in t:
+        return t.replace(".", "-")
+    return t
+
 def fetch_etf_holdings(ticker: str) -> list:
     t = ticker.upper().strip()
     now = time.time()
@@ -624,13 +644,14 @@ def _sanitize_error(msg: str) -> str:
 
 def _yahoo_price(ticker: str) -> float | None:
     """
-    Fetch live price with no API key. Tries multiple no-auth endpoints in order:
-      1. Yahoo chart query1
+    Fetch live price with no API key. Multiple no-auth providers in order:
+      1. Yahoo chart query1 (with one retry on 429)
       2. Yahoo chart query2
-      3. Stooq CSV (completely different provider, no auth, no rate limit)
-    This redundancy is critical: it's the last line of defense when FMP is
-    rate-limited and Yahoo's authenticated endpoints are blocked.
+      3. Stooq CSV (corrected format)
+      4. CNBC quote API (different infra, rarely rate-limited)
+    Redundancy is critical when FMP is rate-limited AND Yahoo throttles the cloud IP.
     """
+    import time as _t
     t = ticker.upper().strip()
     yahoo_t = t.replace(".", "-")
     headers = {
@@ -639,35 +660,59 @@ def _yahoo_price(ticker: str) -> float | None:
         "Accept": "application/json,text/plain,*/*",
     }
 
-    # 1 & 2: Yahoo chart endpoints (no auth required, unlike quoteSummary)
+    # 1 & 2: Yahoo chart endpoints, with one short backoff retry on 429
     for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-        try:
-            url = f"https://{host}/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
-            r = httpx.get(url, timeout=8, headers=headers)
-            if r.status_code == 200:
-                meta = (r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
-                price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
-                if price and float(price) > 0:
-                    return round(float(price), 4)
-        except Exception:
-            continue
+        for attempt in range(2):
+            try:
+                url = f"https://{host}/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
+                r = httpx.get(url, timeout=8, headers=headers)
+                if r.status_code == 429:
+                    _t.sleep(0.6)  # brief backoff, then try once more / next host
+                    continue
+                if r.status_code == 200:
+                    meta = (r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+                    price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
+                    if price and float(price) > 0:
+                        return round(float(price), 4)
+                break
+            except Exception:
+                break
 
-    # 3: Stooq — different provider, CSV, no auth, no rate limit. US tickers use .US suffix.
-    for sym in (f"{t.replace('.', '-').lower()}.us", f"{t.lower()}.us"):
+    # 3: Stooq — CORRECTED format. US tickers: lowercase + ".us". No query-string 'h'.
+    for sym in (f"{yahoo_t.lower()}.us", f"{t.lower()}.us", t.lower()):
         try:
-            url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
+            url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&e=csv"
             r = httpx.get(url, timeout=8, headers=headers)
-            if r.status_code == 200 and r.text:
+            if r.status_code == 200 and r.text and "N/D" not in r.text:
                 lines = r.text.strip().split("\n")
                 if len(lines) >= 2:
                     cols = lines[1].split(",")
-                    # CSV: Symbol,Date,Time,Open,High,Low,Close,Volume — close is index 6
-                    if len(cols) >= 7 and cols[6] not in ("N/D", "", "0"):
-                        price = float(cols[6])
-                        if price > 0:
-                            return round(price, 4)
+                    # Symbol,Date,Time,Open,High,Low,Close,Volume → Close = index 6
+                    if len(cols) >= 7:
+                        try:
+                            price = float(cols[6])
+                            if price > 0:
+                                return round(price, 4)
+                        except (ValueError, IndexError):
+                            pass
         except Exception:
             continue
+
+    # 4: CNBC quote API — separate infrastructure, rarely blocks cloud IPs
+    try:
+        url = f"https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={yahoo_t}&requestMethod=itv&fund=1&exthrs=1&output=json"
+        r = httpx.get(url, timeout=8, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            quotes = data.get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+            if quotes:
+                last = quotes[0].get("last") or quotes[0].get("previous_day_closing")
+                if last:
+                    price = float(str(last).replace(",", ""))
+                    if price > 0:
+                        return round(price, 4)
+    except Exception:
+        pass
 
     return None
 
@@ -832,6 +877,7 @@ def _fmp_get(path: str) -> dict:
 
 def fetch_stock(ticker: str) -> dict:
     t = ticker.upper().strip()
+    fmp_t = _normalize_fmp_ticker(t)   # GOOG→GOOGL, BRK.B→BRK-B for FMP
     hit = _stock_cache.get(t)
     if hit and hit[0] > time.time():
         return hit[1]
@@ -844,8 +890,8 @@ def fetch_stock(ticker: str) -> dict:
         # /stable/key-metrics-ttm    → PE ratio, FCF yield (most reliable source)
         # /stable/income-statement   → revenue history for growth calc
         try:
-            # 1. Quote: real-time price + name + market cap
-            quote_raw = _fmp_get(f"quote?symbol={t}")
+            # 1. Quote: real-time price + name + market cap (normalized ticker)
+            quote_raw = _fmp_get(f"quote?symbol={fmp_t}")
 
             # ── If FMP quote is empty, use FULL Yahoo Finance fundamentals ──
             if not quote_raw or not isinstance(quote_raw, list) or not quote_raw:
@@ -860,15 +906,15 @@ def fetch_stock(ticker: str) -> dict:
             q = quote_raw[0]
 
             # 2. Key metrics TTM: PE ratio + FCF yield (most reliable FMP source)
-            km_raw = _fmp_get(f"key-metrics-ttm?symbol={t}")
+            km_raw = _fmp_get(f"key-metrics-ttm?symbol={fmp_t}")
             km = km_raw[0] if km_raw and isinstance(km_raw, list) else {}
 
             # 3. Ratios TTM: margins + debt/equity + dividend yield
-            ratios_raw = _fmp_get(f"ratios-ttm?symbol={t}")
+            ratios_raw = _fmp_get(f"ratios-ttm?symbol={fmp_t}")
             r = ratios_raw[0] if ratios_raw and isinstance(ratios_raw, list) else {}
 
             # 4. Income statement: 4 years for revenue growth + EPS predictability
-            income_raw = _fmp_get(f"income-statement?symbol={t}&limit=4&period=annual")
+            income_raw = _fmp_get(f"income-statement?symbol={fmp_t}&limit=4&period=annual")
             rev_growth = None
             eps_history = []   # list of EPS values newest→oldest, for predictability check
             if income_raw and len(income_raw) >= 2:
@@ -1911,7 +1957,7 @@ def debug_ticker(ticker: str):
     t = ticker.upper().strip()
     result = {
         "ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK,
-        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.2-fallback-chain",
+        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.3-ticker-norm-multi-source",
         "sources": {},
     }
     if MOCK:
@@ -1919,18 +1965,21 @@ def debug_ticker(ticker: str):
         return result
 
     yahoo_t = t.replace(".", "-")
+    fmp_t = _normalize_fmp_ticker(t)
+    result["fmp_normalized_ticker"] = fmp_t
     hdrs = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
-    # 1. FMP
+    # 1. FMP (using normalized ticker — GOOG→GOOGL)
     if FMP_API_KEY:
         try:
-            quote = _fmp_get(f"quote?symbol={t}")
+            quote = _fmp_get(f"quote?symbol={fmp_t}")
             price = quote[0].get("price") if quote and isinstance(quote, list) and quote else None
             result["sources"]["fmp"] = {"reachable": True, "price": price,
-                                         "empty": not bool(quote)}
+                                         "queried_as": fmp_t, "empty": not bool(quote)}
         except Exception as e:
-            result["sources"]["fmp"] = {"reachable": False, "error": _sanitize_error(e)[:120]}
+            result["sources"]["fmp"] = {"reachable": False, "queried_as": fmp_t,
+                                         "error": _sanitize_error(e)[:120]}
     else:
         result["sources"]["fmp"] = {"reachable": False, "error": "FMP_API_KEY not set"}
 
@@ -1945,22 +1994,37 @@ def debug_ticker(ticker: str):
         except Exception as e:
             result["sources"][f"yahoo_chart_{i}"] = {"error": str(e)[:120]}
 
-    # 3. Stooq
+    # 3. Stooq (corrected format)
     try:
-        sym = f"{t.replace('.', '-').lower()}.us"
-        r = httpx.get(f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv", timeout=8, headers=hdrs)
+        sym = f"{yahoo_t.lower()}.us"
+        r = httpx.get(f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&e=csv", timeout=8, headers=hdrs)
         price = None
-        if r.status_code == 200 and r.text:
+        if r.status_code == 200 and r.text and "N/D" not in r.text:
             lines = r.text.strip().split("\n")
             if len(lines) >= 2:
                 cols = lines[1].split(",")
-                if len(cols) >= 7 and cols[6] not in ("N/D", "", "0"):
-                    price = float(cols[6])
-        result["sources"]["stooq"] = {"http": r.status_code, "price": price}
+                if len(cols) >= 7:
+                    try: price = float(cols[6])
+                    except (ValueError, IndexError): pass
+        result["sources"]["stooq"] = {"http": r.status_code, "price": price, "queried_as": sym}
     except Exception as e:
         result["sources"]["stooq"] = {"error": str(e)[:120]}
 
-    # 4. What the actual pipeline returns
+    # 4. CNBC
+    try:
+        url = f"https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={yahoo_t}&requestMethod=itv&fund=1&exthrs=1&output=json"
+        r = httpx.get(url, timeout=8, headers=hdrs)
+        price = None
+        if r.status_code == 200:
+            quotes = r.json().get("FormattedQuoteResult", {}).get("FormattedQuote", [])
+            if quotes:
+                last = quotes[0].get("last") or quotes[0].get("previous_day_closing")
+                if last: price = float(str(last).replace(",", ""))
+        result["sources"]["cnbc"] = {"http": r.status_code, "price": price}
+    except Exception as e:
+        result["sources"]["cnbc"] = {"error": str(e)[:120]}
+
+    # 5. What the actual pipeline returns
     try:
         data = fetch_stock(t) if not is_etf(t) else {"note": "ETF — use analyze endpoint"}
         result["pipeline_price"] = data.get("price")
@@ -1975,7 +2039,7 @@ def debug_ticker(ticker: str):
 
 @app.get("/")
 def root():
-    return {"service": "PhaseLens API", "version": "2.1", "status": "ok",
+    return {"service": "PhaseLens API", "version": "2.3", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
             "fmp_enabled": bool(FMP_API_KEY),
             "fmp_calls_today": _fmp_call_count["count"],
