@@ -171,12 +171,42 @@ ETF_HOLDINGS_TTL = 7 * 24 * 3600  # 7 days — holdings change weekly
 ETF_CONST_TTL    = 24 * 3600      # 24 hours — metrics change daily
 
 KNOWN_ETFS = {
-    "SPY","VOO","VTI","QQQ","QQQM","VGT","SMH","SCHD","BND","VXUS",
-    "FNILX","SPAXX","IVV","VUG","VTV","VYM","JEPI","AGG","TLT","GLD",
+    # Broad market
+    "SPY","VOO","VTI","QQQ","QQQM","IVV","VUG","VTV","RSP","SCHB","ITOT","SPTM",
+    # Vanguard family
+    "VGT","SMH","SCHD","VXUS","VYM","VIG","VNQ","VEA","VWO","VB","VO","VBR","VBK","VIOG",
+    # Fixed income
+    "BND","FNILX","SPAXX","AGG","TLT","IEF","SHY","LQD","HYG","BNDX","VMFXX","FDRXX",
+    # Sector SPDR
     "XLK","XLF","XLE","XLV","XLY","XLI","XLU","XLRE","XLC","XLB","XLP",
-    "ARKK","SOXX","IWM","MDY","DIA","EEM","EFA","IEFA","ACWI","VEA",
-    "BNDX","LQD","HYG","SHY","IEF","RSP","COWZ","QUAL","MTUM","USMV",
-    "VIG","DVY","SDY","VNQ","SOXQ","MAGS","CQQQ","KWEB",
+    # International
+    "EEM","EFA","IEFA","ACWI","EWJ","FXI","MCHI","INDA","EWZ","CQQQ","KWEB",
+    # Thematic / Smart Beta
+    "ARKK","ARKG","ARKW","ARKQ","ARKF","SOXX","SOXQ","IWM","MDY","DIA",
+    "MAGS","COWZ","QUAL","MTUM","USMV","DVY","SDY","JEPI","JEPQ","DIVO",
+    # Quantum / AI / Tech thematic ← the missing ones causing failures
+    "QTUM",   # Defiance Quantum ETF
+    "BOTZ",   # Global X Robotics & AI ETF
+    "ROBO",   # ROBO Global Robotics & Automation
+    "IRBO",   # iShares Robotics & AI Multisector ETF
+    "AIQ",    # Global X Artificial Intelligence & Technology
+    "CHAT",   # Roundhill Generative AI & Technology ETF
+    "THNQ",   # ROBO Global Artificial Intelligence ETF
+    "LRNZ",   # TrueShares Technology, AI & Deep Learning ETF
+    # Semiconductor
+    "SOXL","SOXS","USD","SOXX",
+    # Crypto ETFs
+    "IBIT","FBTC","GBTC","ETHE","BITO","BITB",
+    # Leveraged
+    "TQQQ","SQQQ","SPXL","SPXS","UVXY","VIXY","UPRO","SPDW",
+    # Clean energy / sector
+    "ICLN","TAN","QCLN","JETS","DRIV","KARS","BETZ","HERO","ESPO",
+    # Healthcare / biotech
+    "XBI","IBB","IHI","ARKG",
+    # Real estate
+    "VNQ","IYR","VNQI",
+    # Gold / commodities
+    "GLD","IAU","SLV","GDX","GDXJ","USO","DBO","PDBC","COMT",
 }
 BOND_FUNDS = {"BND","BNDX","AGG","TLT","IEF","SHY","LQD","HYG","SPAXX","VMFXX","FDRXX"}
 FINANCIAL_SECTORS = {"Financial Services","Financials","Banking","Insurance","Financial"}
@@ -204,6 +234,11 @@ def fetch_etf_holdings(ticker: str) -> list:
             "VTI":  [{"asset":"AAPL","weightPercentage":6.5},{"asset":"MSFT","weightPercentage":6.1},{"asset":"NVDA","weightPercentage":5.8},{"asset":"AMZN","weightPercentage":3.4},{"asset":"META","weightPercentage":2.2},{"asset":"GOOGL","weightPercentage":1.9},{"asset":"BRK.B","weightPercentage":1.6},{"asset":"TSLA","weightPercentage":1.4},{"asset":"UNH","weightPercentage":1.2},{"asset":"AVGO","weightPercentage":1.1}],
             "VXUS": [{"asset":"TSM","weightPercentage":2.1},{"asset":"ASML","weightPercentage":1.2},{"asset":"NESN","weightPercentage":1.1},{"asset":"SAMSUNG","weightPercentage":0.9},{"asset":"LVMH","weightPercentage":0.8},{"asset":"NOVO","weightPercentage":0.7},{"asset":"SHEL","weightPercentage":0.7},{"asset":"AZN","weightPercentage":0.6},{"asset":"HSBC","weightPercentage":0.6},{"asset":"ROCHE","weightPercentage":0.5}],
             "FNILX":[{"asset":"AAPL","weightPercentage":7.1},{"asset":"MSFT","weightPercentage":6.7},{"asset":"NVDA","weightPercentage":6.4},{"asset":"AMZN","weightPercentage":3.7},{"asset":"META","weightPercentage":2.4},{"asset":"GOOGL","weightPercentage":2.0},{"asset":"BRK.B","weightPercentage":1.6},{"asset":"TSLA","weightPercentage":1.4},{"asset":"UNH","weightPercentage":1.3},{"asset":"AVGO","weightPercentage":1.2}],
+            # Thematic ETFs
+            "QTUM":[{"asset":"IONQ","weightPercentage":8.2},{"asset":"RGTI","weightPercentage":7.1},{"asset":"QBTS","weightPercentage":6.5},{"asset":"QUBT","weightPercentage":5.8},{"asset":"IBM","weightPercentage":5.2},{"asset":"GOOGL","weightPercentage":4.9},{"asset":"MSFT","weightPercentage":4.5},{"asset":"NVDA","weightPercentage":4.1},{"asset":"HONEYWELL","weightPercentage":3.8},{"asset":"INTC","weightPercentage":3.5}],
+            "BOTZ":[{"asset":"ISRG","weightPercentage":11.0},{"asset":"ABB","weightPercentage":9.5},{"asset":"NVDA","weightPercentage":8.3},{"asset":"FANUY","weightPercentage":7.2},{"asset":"KEYENCE","weightPercentage":6.8},{"asset":"OMRNY","weightPercentage":5.1},{"asset":"ROK","weightPercentage":4.8},{"asset":"IRBT","weightPercentage":4.2},{"asset":"PATH","weightPercentage":3.9},{"asset":"TRMB","weightPercentage":3.5}],
+            "SOXX":[{"asset":"NVDA","weightPercentage":8.2},{"asset":"AVGO","weightPercentage":8.0},{"asset":"AMD","weightPercentage":4.8},{"asset":"QCOM","weightPercentage":4.5},{"asset":"TSM","weightPercentage":4.2},{"asset":"TXN","weightPercentage":4.0},{"asset":"INTC","weightPercentage":3.8},{"asset":"MCHP","weightPercentage":3.5},{"asset":"LRCX","weightPercentage":3.3},{"asset":"AMAT","weightPercentage":3.1}],
+            "ARKK":[{"asset":"TSLA","weightPercentage":9.8},{"asset":"COIN","weightPercentage":8.2},{"asset":"ROKU","weightPercentage":7.1},{"asset":"PATH","weightPercentage":6.5},{"asset":"EXAS","weightPercentage":5.8},{"asset":"TWST","weightPercentage":5.2},{"asset":"CRSP","weightPercentage":4.9},{"asset":"BEAM","weightPercentage":4.3},{"asset":"PACB","weightPercentage":3.8},{"asset":"SQ","weightPercentage":3.5}],
         }
         data = mock.get(t, [{"asset":"AAPL","weightPercentage":20.0},{"asset":"MSFT","weightPercentage":18.0},{"asset":"NVDA","weightPercentage":15.0}])
         _ETF_HOLDINGS_CACHE[t] = (now, data)
@@ -232,6 +267,7 @@ def fetch_etf_holdings(ticker: str) -> list:
             "QQQ":  [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1}],
             "QQQM": [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1}],
             "SMH":  [{"asset":"NVDA","weightPercentage":19.8},{"asset":"TSM","weightPercentage":12.1},{"asset":"AVGO","weightPercentage":7.8},{"asset":"ASML","weightPercentage":5.2},{"asset":"AMD","weightPercentage":4.9},{"asset":"MU","weightPercentage":3.8}],
+            "SOXX": [{"asset":"NVDA","weightPercentage":8.2},{"asset":"AVGO","weightPercentage":8.0},{"asset":"AMD","weightPercentage":4.8},{"asset":"QCOM","weightPercentage":4.5},{"asset":"TSM","weightPercentage":4.2},{"asset":"MU","weightPercentage":3.5}],
             "SCHD": [{"asset":"EOG","weightPercentage":4.2},{"asset":"CVX","weightPercentage":4.1},{"asset":"HD","weightPercentage":4.0},{"asset":"PEP","weightPercentage":3.9},{"asset":"AMGN","weightPercentage":3.8},{"asset":"KO","weightPercentage":3.7}],
             "VGT":  [{"asset":"AAPL","weightPercentage":15.2},{"asset":"MSFT","weightPercentage":14.8},{"asset":"NVDA","weightPercentage":13.5},{"asset":"AVGO","weightPercentage":4.8},{"asset":"AMD","weightPercentage":2.9}],
             "VTI":  [{"asset":"AAPL","weightPercentage":6.5},{"asset":"MSFT","weightPercentage":6.1},{"asset":"NVDA","weightPercentage":5.8},{"asset":"AMZN","weightPercentage":3.4},{"asset":"META","weightPercentage":2.2}],
@@ -239,6 +275,12 @@ def fetch_etf_holdings(ticker: str) -> list:
             "FNILX":[{"asset":"AAPL","weightPercentage":7.1},{"asset":"MSFT","weightPercentage":6.7},{"asset":"NVDA","weightPercentage":6.4},{"asset":"AMZN","weightPercentage":3.7},{"asset":"META","weightPercentage":2.4}],
             "BND":  [{"asset":"US_TREASURY","weightPercentage":100.0}],
             "SPAXX":[{"asset":"US_TREASURY","weightPercentage":100.0}],
+            # Thematic / quantum / AI ETFs
+            "QTUM": [{"asset":"IBM","weightPercentage":8.5},{"asset":"GOOGL","weightPercentage":7.8},{"asset":"MSFT","weightPercentage":7.2},{"asset":"NVDA","weightPercentage":6.5},{"asset":"IONQ","weightPercentage":5.9},{"asset":"RGTI","weightPercentage":4.8},{"asset":"QBTS","weightPercentage":4.2},{"asset":"INTC","weightPercentage":3.8}],
+            "BOTZ": [{"asset":"ISRG","weightPercentage":11.0},{"asset":"NVDA","weightPercentage":9.5},{"asset":"ABB","weightPercentage":8.3},{"asset":"ROK","weightPercentage":6.1},{"asset":"PATH","weightPercentage":5.8},{"asset":"TRMB","weightPercentage":4.9}],
+            "ARKK": [{"asset":"TSLA","weightPercentage":9.8},{"asset":"COIN","weightPercentage":8.2},{"asset":"ROKU","weightPercentage":7.1},{"asset":"PATH","weightPercentage":6.5},{"asset":"EXAS","weightPercentage":5.8},{"asset":"CRSP","weightPercentage":4.9}],
+            "ICLN": [{"asset":"ENPH","weightPercentage":8.5},{"asset":"FSLR","weightPercentage":7.9},{"asset":"NEE","weightPercentage":6.8},{"asset":"SEDG","weightPercentage":5.1},{"asset":"BEP","weightPercentage":4.9},{"asset":"PLUG","weightPercentage":4.2}],
+            "XBI":  [{"asset":"RXRX","weightPercentage":3.2},{"asset":"BLUE","weightPercentage":2.9},{"asset":"SRPT","weightPercentage":2.8},{"asset":"VRTX","weightPercentage":2.7},{"asset":"REGN","weightPercentage":2.6},{"asset":"BIIB","weightPercentage":2.4}],
         }
         fallback = _fb.get(t)
     if fallback:
@@ -412,6 +454,10 @@ def fetch_etf_wrapper_data(ticker: str) -> dict:
             "VXUS": {"nav":86.02,"price":86.06,"expense_ratio":0.07,"benchmark":"FTSE Global All Cap ex US"},
             "FNILX":{"nav":27.06,"price":27.07,"expense_ratio":0.00,"benchmark":"Fidelity US Large Cap"},
             "SPAXX":{"nav":1.00, "price":1.00, "expense_ratio":0.42,"benchmark":"Money Market"},
+            "QTUM": {"nav":None,"price":None,"expense_ratio":0.40,"benchmark":"Defiance Quantum Index"},
+            "BOTZ": {"nav":None,"price":None,"expense_ratio":0.69,"benchmark":"Indxx Global Robotics & AI"},
+            "SOXX": {"nav":None,"price":None,"expense_ratio":0.35,"benchmark":"ICE Semiconductor"},
+            "ARKK": {"nav":None,"price":None,"expense_ratio":0.75,"benchmark":"ARK Innovation"},
         }
         return mock.get(t, {"nav":None,"price":None,"expense_ratio":None,"benchmark":"Unknown"})
     result = {"nav":None,"price":None,"expense_ratio":None,"benchmark":"Unknown"}
@@ -667,8 +713,24 @@ def fetch_stock(ticker: str) -> dict:
         try:
             # 1. Quote: real-time price + name + market cap
             quote_raw = _fmp_get(f"quote?symbol={t}")
-            if not quote_raw or not isinstance(quote_raw, list):
-                raise HTTPException(503, f"No data for {t} — verify the ticker symbol")
+
+            # ── FIX: If FMP quote is empty, try Yahoo Finance before giving up ──
+            if not quote_raw or not isinstance(quote_raw, list) or not quote_raw:
+                yahoo_p = _yahoo_price(t)
+                if yahoo_p:
+                    print(f"ℹ️  {t}: FMP quote empty, using Yahoo Finance: ${yahoo_p}")
+                    # Build minimal data and skip remaining FMP calls that would also be empty
+                    data = {
+                        "ticker": t, "name": t, "price": yahoo_p,
+                        "pe_ratio": None, "fcf_yield": None, "gross_margin": None,
+                        "operating_margin": None, "revenue_growth": None,
+                        "dividend_yield": None, "debt_to_equity": None,
+                        "market_cap": 0, "roic": None, "eps_history": [],
+                        "_price_source": "yahoo_only",
+                    }
+                    _stock_cache[t] = (time.time() + STOCK_TTL, data)
+                    return data
+                raise HTTPException(503, f"No market data found for '{t}' — check the ticker symbol is correct and listed on a major exchange.")
             q = quote_raw[0]
 
             # 2. Key metrics TTM: PE ratio + FCF yield (most reliable FMP source)
