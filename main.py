@@ -1129,25 +1129,36 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         confidence = "HIGH" if buffett_score >= 3 and dilution_flag in ("CLEAN","BUYBACK") else "MEDIUM"
         summary = (f"Not a value play — priced for growth (P/E {pe:.1f}x). "
                    f"Evaluate on Rule of 40 and revenue quality, not traditional value metrics.")
-    elif not optically_cheap and pe and pe > 25:
-        verdict = "NOT_VALUE"
-        confidence = "HIGH"
-        summary = f"P/E {pe:.1f}x — not in value territory by traditional screens. Analyze as growth or quality compounder."
     elif trap_score >= 40 and trap_score > value_score:
         verdict = "VALUE_TRAP"
         confidence = "HIGH" if trap_score >= 60 else "MEDIUM"
-        summary = (f"Classic value trap pattern: optically cheap{'(P/E {:.1f}x)'.format(pe) if pe else ''} "
-                   f"but fundamentals are deteriorating underneath. "
+        summary = (f"Classic value trap pattern: "
+                   f"{'P/E {:.1f}x with deteriorating fundamentals'.format(pe) if pe else 'fundamentals are deteriorating underneath'}. "
                    f"Trap score {trap_score} vs value score {value_score}.")
     elif trap_score > 20 and trap_score > value_score * 0.8:
         verdict = "VALUE_TRAP"
         confidence = "MEDIUM"
         summary = f"More trap than value — {len(warnings)} red flags outweigh {len(reasons)} positives."
+    elif not optically_cheap and pe and pe > 25:
+        # High P/E only means NOT_VALUE if quality metrics justify the premium:
+        # strong balance sheet (Buffett ≥ 3/5) AND positive growth AND healthy margin.
+        # High P/E + poor fundamentals = elevated risk, not a quality compounder.
+        is_quality_justified = buffett_score >= 3 and rg > 0 and om > 10
+        if is_quality_justified:
+            verdict = "NOT_VALUE"
+            confidence = "HIGH"
+            summary = f"P/E {pe:.1f}x — not in value territory by traditional screens. Analyze as growth or quality compounder."
+        else:
+            verdict = "VALUE_TRAP"
+            confidence = "MEDIUM"
+            summary = (f"High P/E ({pe:.1f}x) without quality support — "
+                       f"ROIC and margin do not justify the premium. "
+                       f"Elevated risk of mean reversion.")
     elif value_score >= 40 and optically_cheap:
         verdict = "VALUE_STOCK"
         confidence = "HIGH" if value_score >= 60 and trap_score < 15 else "MEDIUM"
         summary = (f"Genuine value opportunity: cheap{' (P/E {:.1f}x)'.format(pe) if pe else ''} "
-                   f"with intact fundamentals. Value score {value_score} vs trap score {trap_score}.")
+                   f"with intact fundamentals. Value score {value_score} vs trap score {value_score}.")
     elif value_score >= 30 and trap_score < 20:
         verdict = "VALUE_STOCK"
         confidence = "MEDIUM"
@@ -1428,6 +1439,15 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
     if vv in ("GROWTH_PLAY", "NOT_VALUE") and buffett_score >= 4 and value_score >= 50:
         classification = "VALUE STOCK"
 
+    # ── Safety-net: prevent internal contradiction between score/rec and classification ──
+    # If score and recommendation strongly signal SELL (score ≤ 20 or rec=SELL with score ≤ 35),
+    # the classification must be VALUE_TRAP — NEUTRAL is logically incompatible with these signals.
+    if classification == "NEUTRAL" and rec == "SELL" and score <= 35:
+        classification = "VALUE TRAP"
+    # If score ≥ 75 with BUY, don't call it a trap
+    if classification == "VALUE TRAP" and rec == "BUY" and score >= 75:
+        classification = "NEUTRAL"
+
     if classification == "VALUE TRAP":
         market_action = "AVOID OR EXIT PROFILE"
     elif rec == "BUY" and score >= 80:
@@ -1451,12 +1471,22 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
         )
     elif classification == "VALUE TRAP":
         top_warnings = [w.replace("🚨 ","").replace("⚠️ ","") for w in warnings[:3]]
-        reasoning = (
-            f"Classic value trap pattern — optically cheap metrics obscure deteriorating "
-            f"fundamentals. Key red flags: {'; '.join(top_warnings) or 'balance sheet stress and declining margins'}. "
-            f"{'Low P/E of ' + str(round(pe,1)) + 'x is misleading — ' if pe and pe < 18 else ''}"
-            f"the cheap price reflects structural business problems, not temporary sentiment."
-        )
+        if pe and pe > 30:
+            # High P/E trap — the stock is expensive AND fundamentally weak
+            reasoning = (
+                f"Dangerous combination: elevated P/E ({pe:.1f}x) alongside deteriorating fundamentals "
+                f"leaves no margin of safety. Key red flags: {'; '.join(top_warnings) or 'weak balance sheet and declining returns'}. "
+                f"A high multiple on a weak business amplifies downside — "
+                f"mean reversion in both earnings AND multiple creates compounding loss risk."
+            )
+        else:
+            # Classic cheap-price trap
+            reasoning = (
+                f"Classic value trap pattern — optically cheap metrics obscure deteriorating "
+                f"fundamentals. Key red flags: {'; '.join(top_warnings) or 'balance sheet stress and declining margins'}. "
+                f"{'Low P/E of ' + str(round(pe,1)) + 'x is misleading — ' if pe and pe < 18 else ''}"
+                f"the cheap price reflects structural business problems, not temporary sentiment."
+            )
     elif classification == "NEUTRAL":
         reasoning = (
             f"Current valuation{f' (P/E {pe:.1f}x)' if pe else ''} fairly reflects risk-reward. "
