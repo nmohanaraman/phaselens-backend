@@ -624,42 +624,51 @@ def _sanitize_error(msg: str) -> str:
 
 def _yahoo_price(ticker: str) -> float | None:
     """
-    Fetch live price from Yahoo Finance — no API key required.
-    Used as fallback when FMP returns null/empty price.
-    Covers all US equities, ETFs, and most international tickers.
-
-    Yahoo Finance v8 chart endpoint is the same source used by yfinance,
-    the Bloomberg terminal's cross-check feed, and most retail apps.
+    Fetch live price with no API key. Tries multiple no-auth endpoints in order:
+      1. Yahoo chart query1
+      2. Yahoo chart query2
+      3. Stooq CSV (completely different provider, no auth, no rate limit)
+    This redundancy is critical: it's the last line of defense when FMP is
+    rate-limited and Yahoo's authenticated endpoints are blocked.
     """
     t = ticker.upper().strip()
-    # Yahoo tickers: BRK.B → BRK-B, handle common aliases
     yahoo_t = t.replace(".", "-")
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
-        r = httpx.get(url, timeout=8, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; PhaseLens/1.0)",
-            "Accept": "application/json",
-        })
-        if r.status_code == 200:
-            data = r.json()
-            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-            price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
-            if price and float(price) > 0:
-                return round(float(price), 4)
-    except Exception:
-        pass
-    # Fallback: try query2 domain (Yahoo has two clusters, one is sometimes rate-limited)
-    try:
-        url2 = f"https://query2.finance.yahoo.com/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
-        r2 = httpx.get(url2, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if r2.status_code == 200:
-            data2 = r2.json()
-            meta2 = data2.get("chart", {}).get("result", [{}])[0].get("meta", {})
-            price2 = meta2.get("regularMarketPrice") or meta2.get("chartPreviousClose")
-            if price2 and float(price2) > 0:
-                return round(float(price2), 4)
-    except Exception:
-        pass
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
+
+    # 1 & 2: Yahoo chart endpoints (no auth required, unlike quoteSummary)
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            url = f"https://{host}/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
+            r = httpx.get(url, timeout=8, headers=headers)
+            if r.status_code == 200:
+                meta = (r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+                price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
+                if price and float(price) > 0:
+                    return round(float(price), 4)
+        except Exception:
+            continue
+
+    # 3: Stooq — different provider, CSV, no auth, no rate limit. US tickers use .US suffix.
+    for sym in (f"{t.replace('.', '-').lower()}.us", f"{t.lower()}.us"):
+        try:
+            url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
+            r = httpx.get(url, timeout=8, headers=headers)
+            if r.status_code == 200 and r.text:
+                lines = r.text.strip().split("\n")
+                if len(lines) >= 2:
+                    cols = lines[1].split(",")
+                    # CSV: Symbol,Date,Time,Open,High,Low,Close,Volume — close is index 6
+                    if len(cols) >= 7 and cols[6] not in ("N/D", "", "0"):
+                        price = float(cols[6])
+                        if price > 0:
+                            return round(price, 4)
+        except Exception:
+            continue
+
     return None
 
 
@@ -756,7 +765,19 @@ def _yahoo_fundamentals(ticker: str) -> dict:
             return result
         except Exception:
             continue
-    return result
+    # quoteSummary failed entirely (often 401 — Yahoo requires a crumb/cookie since 2024).
+    # Fall back to the chart endpoint, which needs NO auth and reliably returns price.
+    chart_price = _yahoo_price(t)
+    if chart_price:
+        return {
+            "ticker": t, "name": t, "price": chart_price,
+            "pe_ratio": None, "fcf_yield": None, "gross_margin": None,
+            "operating_margin": None, "revenue_growth": None,
+            "dividend_yield": None, "debt_to_equity": None,
+            "market_cap": 0, "roic": None, "eps_history": [],
+            "_price_source": "yahoo_chart",
+        }
+    return {}
 
 
 class FMPError(Exception):
