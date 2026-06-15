@@ -210,18 +210,42 @@ def fetch_etf_holdings(ticker: str) -> list:
         return data
     try:
         raw = _fmp_get(f"etf-holder?symbol={t}")
-        if not raw or not isinstance(raw, list): return []
-        raw.sort(key=lambda x: float(x.get("weightPercentage") or 0), reverse=True)
-        top, cumulative = [], 0.0
-        for h in raw:
-            w = float(h.get("weightPercentage") or 0)
-            if w <= 0: continue
-            top.append(h); cumulative += w
-            if cumulative >= 80.0 or len(top) >= 30: break
-        _ETF_HOLDINGS_CACHE[t] = (now, top)
-        return top
+        if raw and isinstance(raw, list) and len(raw) > 0:
+            raw.sort(key=lambda x: float(x.get("weightPercentage") or 0), reverse=True)
+            top, cumulative = [], 0.0
+            for h in raw:
+                w = float(h.get("weightPercentage") or 0)
+                if w <= 0: continue
+                top.append(h); cumulative += w
+                if cumulative >= 80.0 or len(top) >= 30: break
+            _ETF_HOLDINGS_CACHE[t] = (now, top)
+            return top
     except Exception:
-        return []
+        pass
+    # FMP returned empty or errored — fall back to hardcoded holdings for known ETFs.
+    # This is common on FMP's free plan where etf-holder is restricted.
+    fallback = mock.get(t) if 'mock' in dir() else None
+    if not fallback:
+        # Rebuild mock dict outside the MOCK branch
+        _fb = {
+            "VOO":  [{"asset":"AAPL","weightPercentage":7.2},{"asset":"MSFT","weightPercentage":6.8},{"asset":"NVDA","weightPercentage":6.5},{"asset":"AMZN","weightPercentage":3.8},{"asset":"META","weightPercentage":2.5},{"asset":"GOOGL","weightPercentage":2.1}],
+            "QQQ":  [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1}],
+            "QQQM": [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1}],
+            "SMH":  [{"asset":"NVDA","weightPercentage":19.8},{"asset":"TSM","weightPercentage":12.1},{"asset":"AVGO","weightPercentage":7.8},{"asset":"ASML","weightPercentage":5.2},{"asset":"AMD","weightPercentage":4.9},{"asset":"MU","weightPercentage":3.8}],
+            "SCHD": [{"asset":"EOG","weightPercentage":4.2},{"asset":"CVX","weightPercentage":4.1},{"asset":"HD","weightPercentage":4.0},{"asset":"PEP","weightPercentage":3.9},{"asset":"AMGN","weightPercentage":3.8},{"asset":"KO","weightPercentage":3.7}],
+            "VGT":  [{"asset":"AAPL","weightPercentage":15.2},{"asset":"MSFT","weightPercentage":14.8},{"asset":"NVDA","weightPercentage":13.5},{"asset":"AVGO","weightPercentage":4.8},{"asset":"AMD","weightPercentage":2.9}],
+            "VTI":  [{"asset":"AAPL","weightPercentage":6.5},{"asset":"MSFT","weightPercentage":6.1},{"asset":"NVDA","weightPercentage":5.8},{"asset":"AMZN","weightPercentage":3.4},{"asset":"META","weightPercentage":2.2}],
+            "VXUS": [{"asset":"TSM","weightPercentage":2.1},{"asset":"ASML","weightPercentage":1.2},{"asset":"NESN","weightPercentage":1.1},{"asset":"SAMSUNG","weightPercentage":0.9}],
+            "FNILX":[{"asset":"AAPL","weightPercentage":7.1},{"asset":"MSFT","weightPercentage":6.7},{"asset":"NVDA","weightPercentage":6.4},{"asset":"AMZN","weightPercentage":3.7},{"asset":"META","weightPercentage":2.4}],
+            "BND":  [{"asset":"US_TREASURY","weightPercentage":100.0}],
+            "SPAXX":[{"asset":"US_TREASURY","weightPercentage":100.0}],
+        }
+        fallback = _fb.get(t)
+    if fallback:
+        print(f"ℹ️  ETF {t}: FMP etf-holder empty, using fallback holdings ({len(fallback)} positions)")
+        _ETF_HOLDINGS_CACHE[t] = (now, fallback)
+        return fallback
+    return []
 
 MOCK_CONSTITUENT = {
     "AAPL":{"roic":28.5,"gross_margin":47.9,"debt_to_equity":0.8,"fcf_yield":3.5,"sector":"Technology"},
