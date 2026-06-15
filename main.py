@@ -1905,26 +1905,71 @@ DISCLAIMER = ("PhaseLens is an educational research tool — not a licensed fina
 # ─────────────────────────── Public endpoints ───────────────────────────────
 @app.get("/api/debug/{ticker}")
 def debug_ticker(ticker: str):
-    """Debug: shows raw FMP response for a ticker. Use to diagnose live data issues."""
+    """Debug: tests the ENTIRE data fallback chain live (FMP, Yahoo chart x2,
+    Yahoo quoteSummary, Stooq) so you can see exactly which sources Render can
+    reach. Use this to diagnose 404s: it shows where the chain breaks."""
     t = ticker.upper().strip()
-    result = {"ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK, "fmp_enabled": bool(FMP_API_KEY)}
+    result = {
+        "ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK,
+        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.2-fallback-chain",
+        "sources": {},
+    }
     if MOCK:
-        result["note"] = "Running in MOCK mode — no live FMP data"
+        result["note"] = "Running in MOCK mode — no live data"
         return result
-    if not FMP_API_KEY:
-        result["note"] = "FMP_API_KEY not set — no live data possible"
-        return result
+
+    yahoo_t = t.replace(".", "-")
+    hdrs = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+
+    # 1. FMP
+    if FMP_API_KEY:
+        try:
+            quote = _fmp_get(f"quote?symbol={t}")
+            price = quote[0].get("price") if quote and isinstance(quote, list) and quote else None
+            result["sources"]["fmp"] = {"reachable": True, "price": price,
+                                         "empty": not bool(quote)}
+        except Exception as e:
+            result["sources"]["fmp"] = {"reachable": False, "error": _sanitize_error(e)[:120]}
+    else:
+        result["sources"]["fmp"] = {"reachable": False, "error": "FMP_API_KEY not set"}
+
+    # 2. Yahoo chart endpoints
+    for i, host in enumerate(("query1.finance.yahoo.com", "query2.finance.yahoo.com"), 1):
+        try:
+            url = f"https://{host}/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
+            r = httpx.get(url, timeout=8, headers=hdrs)
+            meta = (r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {}) if r.status_code == 200 else {}
+            price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
+            result["sources"][f"yahoo_chart_{i}"] = {"http": r.status_code, "price": price}
+        except Exception as e:
+            result["sources"][f"yahoo_chart_{i}"] = {"error": str(e)[:120]}
+
+    # 3. Stooq
     try:
-        quote = _fmp_get(f"quote?symbol={t}")
-        result["raw_quote"] = quote[0] if quote and isinstance(quote, list) else quote
-        result["extracted_price"] = quote[0].get("price") if quote and isinstance(quote, list) else None
+        sym = f"{t.replace('.', '-').lower()}.us"
+        r = httpx.get(f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv", timeout=8, headers=hdrs)
+        price = None
+        if r.status_code == 200 and r.text:
+            lines = r.text.strip().split("\n")
+            if len(lines) >= 2:
+                cols = lines[1].split(",")
+                if len(cols) >= 7 and cols[6] not in ("N/D", "", "0"):
+                    price = float(cols[6])
+        result["sources"]["stooq"] = {"http": r.status_code, "price": price}
     except Exception as e:
-        result["quote_error"] = str(e)
+        result["sources"]["stooq"] = {"error": str(e)[:120]}
+
+    # 4. What the actual pipeline returns
     try:
-        km = _fmp_get(f"key-metrics-ttm?symbol={t}&limit=1")
-        result["raw_key_metrics"] = km[0] if km and isinstance(km, list) else km
+        data = fetch_stock(t) if not is_etf(t) else {"note": "ETF — use analyze endpoint"}
+        result["pipeline_price"] = data.get("price")
+        result["pipeline_source"] = data.get("_price_source", "fmp")
+    except HTTPException as he:
+        result["pipeline_error"] = f"HTTP {he.status_code}: {he.detail}"
     except Exception as e:
-        result["key_metrics_error"] = str(e)
+        result["pipeline_error"] = _sanitize_error(e)[:120]
+
     result["fmp_calls_today"] = _fmp_call_count["count"]
     return result
 
