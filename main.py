@@ -264,6 +264,8 @@ def fetch_etf_holdings(ticker: str) -> list:
         # Rebuild mock dict outside the MOCK branch
         _fb = {
             "VOO":  [{"asset":"AAPL","weightPercentage":7.2},{"asset":"MSFT","weightPercentage":6.8},{"asset":"NVDA","weightPercentage":6.5},{"asset":"AMZN","weightPercentage":3.8},{"asset":"META","weightPercentage":2.5},{"asset":"GOOGL","weightPercentage":2.1}],
+            "SPY":  [{"asset":"AAPL","weightPercentage":7.2},{"asset":"MSFT","weightPercentage":6.8},{"asset":"NVDA","weightPercentage":6.5},{"asset":"AMZN","weightPercentage":3.8},{"asset":"META","weightPercentage":2.5},{"asset":"GOOGL","weightPercentage":2.1}],
+            "IVV":  [{"asset":"AAPL","weightPercentage":7.2},{"asset":"MSFT","weightPercentage":6.8},{"asset":"NVDA","weightPercentage":6.5},{"asset":"AMZN","weightPercentage":3.8},{"asset":"META","weightPercentage":2.5},{"asset":"GOOGL","weightPercentage":2.1}],
             "QQQ":  [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1}],
             "QQQM": [{"asset":"AAPL","weightPercentage":8.5},{"asset":"MSFT","weightPercentage":8.1},{"asset":"NVDA","weightPercentage":8.0},{"asset":"AMZN","weightPercentage":4.8},{"asset":"META","weightPercentage":4.2},{"asset":"TSLA","weightPercentage":3.1}],
             "SMH":  [{"asset":"NVDA","weightPercentage":19.8},{"asset":"TSM","weightPercentage":12.1},{"asset":"AVGO","weightPercentage":7.8},{"asset":"ASML","weightPercentage":5.2},{"asset":"AMD","weightPercentage":4.9},{"asset":"MU","weightPercentage":3.8}],
@@ -661,39 +663,149 @@ def _yahoo_price(ticker: str) -> float | None:
     return None
 
 
+def _yahoo_fundamentals(ticker: str) -> dict:
+    """
+    Full fundamentals fallback from Yahoo Finance when FMP fails entirely.
+    Extracts the same fields FMP provides: price, name, P/E, margins, growth,
+    dividend yield, D/E, market cap, ROIC proxy, EPS history, FCF yield.
+
+    Uses Yahoo's quoteSummary modules (no API key). Returns {} on total failure,
+    and the caller falls back to price-only. Ticker is normalized (BRK.B → BRK-B).
+    """
+    t = ticker.upper().strip()
+    yahoo_t = t.replace(".", "-")
+    modules = "price,summaryDetail,financialData,defaultKeyStatistics,earningsHistory"
+    result = {}
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            url = f"https://{host}/v10/finance/quoteSummary/{yahoo_t}?modules={modules}"
+            r = httpx.get(url, timeout=10, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; PhaseLens/1.0)",
+                "Accept": "application/json",
+            })
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            res = (data.get("quoteSummary", {}).get("result") or [{}])[0]
+            if not res:
+                continue
+
+            price_mod = res.get("price", {})
+            summary   = res.get("summaryDetail", {})
+            fin       = res.get("financialData", {})
+            stats     = res.get("defaultKeyStatistics", {})
+            earnings  = res.get("earningsHistory", {})
+
+            def raw(d, k):
+                v = d.get(k)
+                if isinstance(v, dict):
+                    return v.get("raw")
+                return v
+
+            price = raw(price_mod, "regularMarketPrice") or raw(fin, "currentPrice")
+            if not price or float(price) <= 0:
+                # Last resort: chart endpoint price
+                price = _yahoo_price(t)
+            if not price:
+                continue
+
+            result["price"] = round(float(price), 4)
+            result["name"]  = price_mod.get("longName") or price_mod.get("shortName") or t
+            result["market_cap"] = raw(price_mod, "marketCap") or raw(summary, "marketCap") or 0
+
+            pe = raw(summary, "trailingPE") or raw(stats, "trailingEps")
+            result["pe_ratio"] = round(float(pe), 2) if pe and float(pe) > 0 else None
+
+            gm = raw(fin, "grossMargins")
+            result["gross_margin"] = round(float(gm) * 100, 2) if gm is not None else None
+            om = raw(fin, "operatingMargins")
+            result["operating_margin"] = round(float(om) * 100, 2) if om is not None else None
+            rg = raw(fin, "revenueGrowth")
+            result["revenue_growth"] = round(float(rg) * 100, 2) if rg is not None else None
+
+            dy = raw(summary, "dividendYield")
+            result["dividend_yield"] = round(float(dy) * 100, 2) if dy else 0.0
+
+            de = raw(fin, "debtToEquity")
+            # Yahoo reports D/E as a percentage (e.g. 180 = 1.8x) — normalize to ratio
+            result["debt_to_equity"] = round(float(de) / 100, 2) if de is not None else None
+
+            roe = raw(fin, "returnOnEquity")
+            result["roic"] = round(float(roe) * 100, 2) if roe is not None else None
+
+            # EPS history (last 4 actual quarters)
+            eps_hist = []
+            for q in (earnings.get("history") or [])[:4]:
+                e = raw(q, "epsActual")
+                if e is not None:
+                    eps_hist.append(float(e))
+            result["eps_history"] = eps_hist
+
+            # FCF yield: operating cash flow + capex (capex is negative) / market cap
+            ocf = raw(fin, "operatingCashflow")
+            fcf = raw(fin, "freeCashflow")
+            mc  = result["market_cap"]
+            if fcf and mc and mc > 0:
+                result["fcf_yield"] = round(float(fcf) / float(mc) * 100, 2)
+            elif ocf and mc and mc > 0:
+                result["fcf_yield"] = round(float(ocf) / float(mc) * 100, 2)
+            else:
+                result["fcf_yield"] = None
+
+            result["_price_source"] = "yahoo_full"
+            return result
+        except Exception:
+            continue
+    return result
+
+
+class FMPError(Exception):
+    """Internal FMP failure — caught by fetch_stock/fetch_etf so the Yahoo
+    fallback can run. Never bubbles to the client as-is (Bug B fix)."""
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
+
 def _fmp_get(path: str) -> dict:
-    """Call FMP stable API. Tracks daily call count to detect limit exhaustion.
-    All error paths are sanitized so the API key can never leak to the client."""
+    """Call FMP stable API. Raises FMPError (NOT HTTPException) on any failure
+    so callers can fall through to the Yahoo Finance fallback (Bug B fix).
+
+    The in-memory counter is for OBSERVABILITY ONLY — it never blocks a request.
+    Blocking on a cold-start-reset counter caused total failures (Bug A fix);
+    we let FMP itself enforce its real quota and fall back to Yahoo on 429."""
     global _fmp_call_count
     import datetime
     today = datetime.date.today().isoformat()
     if _fmp_call_count["date"] != today:
         _fmp_call_count = {"date": today, "count": 0}
     _fmp_call_count["count"] += 1
-    if _fmp_call_count["count"] > FMP_FREE_DAILY_LIMIT - 10:
-        print(f"⚠️  FMP WARNING: {_fmp_call_count['count']} calls today — approaching 250/day free limit")
+    # Observability only — DO NOT raise/block based on this counter (Bug A).
+    if _fmp_call_count["count"] == FMP_FREE_DAILY_LIMIT:
+        print(f"ℹ️  FMP: reached {FMP_FREE_DAILY_LIMIT} tracked calls today (Yahoo fallback active if FMP rejects).")
 
     separator = "&" if "?" in path else "?"
     url = f"https://financialmodelingprep.com/stable/{path}{separator}apikey={FMP_API_KEY}"
     try:
         r = httpx.get(url, timeout=15)
-    except Exception:
-        raise HTTPException(503, "Market data service unreachable. Please retry shortly.")
+    except Exception as exc:
+        raise FMPError(f"network error: {_sanitize_error(exc)}")
     if r.status_code == 401:
-        raise HTTPException(503, "Market data authentication failed — service misconfigured.")
+        raise FMPError("FMP auth failed (401)", 401)
     if r.status_code == 402:
-        # 402 = invalid/unsupported ticker or plan limit. NEVER echo body (contains key).
-        raise HTTPException(503, "Market data unavailable for this ticker — verify the symbol.")
+        # 402 = invalid/unsupported ticker on this plan, OR ticker-format mismatch
+        # (GOOG vs GOOGL, BRK.B vs BRK-B). Fall through to Yahoo, which handles both (Bug C).
+        raise FMPError("FMP 402 (ticker unsupported on plan or format mismatch)", 402)
     if r.status_code == 429:
-        raise HTTPException(503, f"Market data daily limit reached ({_fmp_call_count['count']} calls today). Resets at midnight UTC.")
+        # Real FMP quota exhausted — fall through to Yahoo (Bug A/B).
+        raise FMPError("FMP 429 (rate limit) — falling back to Yahoo", 429)
     try:
         r.raise_for_status()
     except Exception:
-        # raise_for_status embeds the full URL (with apikey) — never expose it
-        raise HTTPException(503, f"Market data request failed (status {r.status_code}).")
+        raise FMPError(f"FMP request failed (status {r.status_code})", r.status_code)
     data = r.json()
     if isinstance(data, dict) and "Error Message" in data:
-        raise HTTPException(503, f"Market data error: {_sanitize_error(data['Error Message'])}")
+        raise FMPError(f"FMP error: {_sanitize_error(data['Error Message'])}")
     return data
 
 
@@ -714,23 +826,16 @@ def fetch_stock(ticker: str) -> dict:
             # 1. Quote: real-time price + name + market cap
             quote_raw = _fmp_get(f"quote?symbol={t}")
 
-            # ── FIX: If FMP quote is empty, try Yahoo Finance before giving up ──
+            # ── If FMP quote is empty, use FULL Yahoo Finance fundamentals ──
             if not quote_raw or not isinstance(quote_raw, list) or not quote_raw:
-                yahoo_p = _yahoo_price(t)
-                if yahoo_p:
-                    print(f"ℹ️  {t}: FMP quote empty, using Yahoo Finance: ${yahoo_p}")
-                    # Build minimal data and skip remaining FMP calls that would also be empty
-                    data = {
-                        "ticker": t, "name": t, "price": yahoo_p,
-                        "pe_ratio": None, "fcf_yield": None, "gross_margin": None,
-                        "operating_margin": None, "revenue_growth": None,
-                        "dividend_yield": None, "debt_to_equity": None,
-                        "market_cap": 0, "roic": None, "eps_history": [],
-                        "_price_source": "yahoo_only",
-                    }
-                    _stock_cache[t] = (time.time() + STOCK_TTL, data)
-                    return data
-                raise HTTPException(503, f"No market data found for '{t}' — check the ticker symbol is correct and listed on a major exchange.")
+                yf_data = _yahoo_fundamentals(t)
+                if yf_data.get("price"):
+                    print(f"ℹ️  {t}: FMP quote empty, using Yahoo fundamentals: ${yf_data['price']}")
+                    yf_data["ticker"] = t
+                    _stock_cache[t] = (time.time() + STOCK_TTL, yf_data)
+                    return yf_data
+                # Yahoo also failed → final safety net (404, never expose key)
+                raise HTTPException(404, f"Market data unavailable for {t}. Please verify the symbol.")
             q = quote_raw[0]
 
             # 2. Key metrics TTM: PE ratio + FCF yield (most reliable FMP source)
@@ -765,7 +870,7 @@ def fetch_stock(ticker: str) -> dict:
                     print(f"ℹ️  {t}: FMP price null, used Yahoo Finance fallback: ${price}")
 
             if not price:
-                raise HTTPException(503, f"No price returned for {t} — verify the ticker symbol")
+                raise HTTPException(404, f"Market data unavailable for {t}. Please verify the symbol.")
 
             # Helper: first non-null non-zero value across multiple sources + field names
             def pick(*pairs, pct=False):
@@ -804,21 +909,18 @@ def fetch_stock(ticker: str) -> dict:
             }
         except HTTPException:
             raise
-        except Exception as exc:
-            # FMP failed — try Yahoo Finance for at least the price
-            yahoo_price = _yahoo_price(t)
-            if yahoo_price:
-                print(f"ℹ️  {t}: FMP failed, using Yahoo Finance for price: ${yahoo_price}")
-                data = {
-                    "ticker": t, "name": t, "price": yahoo_price,
-                    "pe_ratio": None, "fcf_yield": None, "gross_margin": None,
-                    "operating_margin": None, "revenue_growth": None,
-                    "dividend_yield": None, "debt_to_equity": None,
-                    "market_cap": 0, "roic": None, "eps_history": [],
-                    "_price_source": "yahoo_fallback",
-                }
+        except (FMPError, Exception) as exc:
+            # FMP failed (rate limit, 402, format mismatch, network) — fall through
+            # to the FULL Yahoo Finance fundamentals (Bug B fix). This is the path
+            # that handles GOOG/BRK.B format mismatches that FMP rejects (Bug C).
+            yf_data = _yahoo_fundamentals(t)
+            if yf_data.get("price"):
+                print(f"ℹ️  {t}: FMP failed ({_sanitize_error(exc)}), using Yahoo fundamentals: ${yf_data['price']}")
+                yf_data["ticker"] = t
+                data = yf_data
             else:
-                raise HTTPException(503, f"Market data unavailable for {t}: {_sanitize_error(exc)}")
+                # Final safety net: only now do we fail — with a clean 404, never the key
+                raise HTTPException(404, f"Market data unavailable for {t}. Please verify the symbol.")
     else:
         # ── yfinance fallback (works locally, unreliable on cloud) ──
         try:
@@ -1807,12 +1909,12 @@ def debug_ticker(ticker: str):
 
 @app.get("/")
 def root():
-    return {"service": "PhaseLens API", "version": "2.0", "status": "ok",
+    return {"service": "PhaseLens API", "version": "2.1", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
             "fmp_enabled": bool(FMP_API_KEY),
             "fmp_calls_today": _fmp_call_count["count"],
-            "fmp_daily_limit": FMP_FREE_DAILY_LIMIT,
-            "fmp_calls_remaining": max(0, FMP_FREE_DAILY_LIMIT - _fmp_call_count["count"]),
+            "fmp_calls_note": "observability only — does not block requests; Yahoo fallback active on FMP failure",
+            "yahoo_fallback": "enabled",
             "auth_enabled": bool(FIREBASE_PROJECT_ID)}
 
 @app.get("/api/stock/{ticker}")
