@@ -420,6 +420,14 @@ def fetch_etf_wrapper_data(ticker: str) -> dict:
         if q and isinstance(q, list) and q:
             result["price"] = q[0].get("price"); result["nav"] = q[0].get("navPrice") or q[0].get("price")
     except Exception: pass
+    # If FMP returned no price for this ETF, try Yahoo Finance
+    if not result["price"]:
+        yahoo_p = _yahoo_price(t)
+        if yahoo_p:
+            print(f"ℹ️  ETF {t}: FMP price null, used Yahoo Finance: ${yahoo_p}")
+            result["price"] = yahoo_p
+            if not result["nav"]:
+                result["nav"] = yahoo_p  # NAV ≈ price for liquid ETFs
     try:
         info = _fmp_get(f"etf-info?symbol={t}")
         if info and isinstance(info, list) and info:
@@ -566,6 +574,47 @@ def _sanitize_error(msg: str) -> str:
     return s
 
 
+def _yahoo_price(ticker: str) -> float | None:
+    """
+    Fetch live price from Yahoo Finance — no API key required.
+    Used as fallback when FMP returns null/empty price.
+    Covers all US equities, ETFs, and most international tickers.
+
+    Yahoo Finance v8 chart endpoint is the same source used by yfinance,
+    the Bloomberg terminal's cross-check feed, and most retail apps.
+    """
+    t = ticker.upper().strip()
+    # Yahoo tickers: BRK.B → BRK-B, handle common aliases
+    yahoo_t = t.replace(".", "-")
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
+        r = httpx.get(url, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; PhaseLens/1.0)",
+            "Accept": "application/json",
+        })
+        if r.status_code == 200:
+            data = r.json()
+            meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
+            if price and float(price) > 0:
+                return round(float(price), 4)
+    except Exception:
+        pass
+    # Fallback: try query2 domain (Yahoo has two clusters, one is sometimes rate-limited)
+    try:
+        url2 = f"https://query2.finance.yahoo.com/v8/finance/chart/{yahoo_t}?interval=1d&range=1d"
+        r2 = httpx.get(url2, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        if r2.status_code == 200:
+            data2 = r2.json()
+            meta2 = data2.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price2 = meta2.get("regularMarketPrice") or meta2.get("chartPreviousClose")
+            if price2 and float(price2) > 0:
+                return round(float(price2), 4)
+    except Exception:
+        pass
+    return None
+
+
 def _fmp_get(path: str) -> dict:
     """Call FMP stable API. Tracks daily call count to detect limit exhaustion.
     All error paths are sanitized so the API key can never leak to the client."""
@@ -648,7 +697,13 @@ def fetch_stock(ticker: str) -> dict:
             mc    = q.get("marketCap") or 0
 
             if not price:
-                raise HTTPException(503, f"No price returned for {t} — check ticker symbol")
+                # FMP returned no price — try Yahoo Finance as fallback (no API key needed)
+                price = _yahoo_price(t)
+                if price:
+                    print(f"ℹ️  {t}: FMP price null, used Yahoo Finance fallback: ${price}")
+
+            if not price:
+                raise HTTPException(503, f"No price returned for {t} — verify the ticker symbol")
 
             # Helper: first non-null non-zero value across multiple sources + field names
             def pick(*pairs, pct=False):
@@ -688,7 +743,20 @@ def fetch_stock(ticker: str) -> dict:
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(503, f"Market data unavailable for {t}: {_sanitize_error(exc)}")
+            # FMP failed — try Yahoo Finance for at least the price
+            yahoo_price = _yahoo_price(t)
+            if yahoo_price:
+                print(f"ℹ️  {t}: FMP failed, using Yahoo Finance for price: ${yahoo_price}")
+                data = {
+                    "ticker": t, "name": t, "price": yahoo_price,
+                    "pe_ratio": None, "fcf_yield": None, "gross_margin": None,
+                    "operating_margin": None, "revenue_growth": None,
+                    "dividend_yield": None, "debt_to_equity": None,
+                    "market_cap": 0, "roic": None, "eps_history": [],
+                    "_price_source": "yahoo_fallback",
+                }
+            else:
+                raise HTTPException(503, f"Market data unavailable for {t}: {_sanitize_error(exc)}")
     else:
         # ── yfinance fallback (works locally, unreliable on cloud) ──
         try:
