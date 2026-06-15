@@ -530,8 +530,21 @@ MOCK_DATA = {
 _fmp_call_count = {"date": "", "count": 0}
 FMP_FREE_DAILY_LIMIT = 250
 
+def _sanitize_error(msg: str) -> str:
+    """Strip API keys, URLs, and query params from any error string before it
+    can reach the client. SECURITY: prevents FMP API key leakage (bug #1)."""
+    import re
+    s = str(msg)
+    if FMP_API_KEY:
+        s = s.replace(FMP_API_KEY, "[REDACTED]")
+    s = re.sub(r"apikey=[^&\s'\"]+", "apikey=[REDACTED]", s, flags=re.IGNORECASE)
+    s = re.sub(r"https?://[^\s'\"]+", "[url]", s)
+    return s
+
+
 def _fmp_get(path: str) -> dict:
-    """Call FMP stable API. Tracks daily call count to detect limit exhaustion."""
+    """Call FMP stable API. Tracks daily call count to detect limit exhaustion.
+    All error paths are sanitized so the API key can never leak to the client."""
     global _fmp_call_count
     import datetime
     today = datetime.date.today().isoformat()
@@ -541,18 +554,27 @@ def _fmp_get(path: str) -> dict:
     if _fmp_call_count["count"] > FMP_FREE_DAILY_LIMIT - 10:
         print(f"⚠️  FMP WARNING: {_fmp_call_count['count']} calls today — approaching 250/day free limit")
 
-    # Detect URL construction bug: path must include '?' before apikey '&'
     separator = "&" if "?" in path else "?"
     url = f"https://financialmodelingprep.com/stable/{path}{separator}apikey={FMP_API_KEY}"
-    r = httpx.get(url, timeout=15)
+    try:
+        r = httpx.get(url, timeout=15)
+    except Exception:
+        raise HTTPException(503, "Market data service unreachable. Please retry shortly.")
     if r.status_code == 401:
-        raise HTTPException(503, "FMP API key invalid — check FMP_API_KEY on Render")
+        raise HTTPException(503, "Market data authentication failed — service misconfigured.")
+    if r.status_code == 402:
+        # 402 = invalid/unsupported ticker or plan limit. NEVER echo body (contains key).
+        raise HTTPException(503, "Market data unavailable for this ticker — verify the symbol.")
     if r.status_code == 429:
-        raise HTTPException(503, f"FMP daily limit reached ({_fmp_call_count['count']} calls today). Resets at midnight UTC. Upgrade at financialmodelingprep.com for higher limits.")
-    r.raise_for_status()
+        raise HTTPException(503, f"Market data daily limit reached ({_fmp_call_count['count']} calls today). Resets at midnight UTC.")
+    try:
+        r.raise_for_status()
+    except Exception:
+        # raise_for_status embeds the full URL (with apikey) — never expose it
+        raise HTTPException(503, f"Market data request failed (status {r.status_code}).")
     data = r.json()
     if isinstance(data, dict) and "Error Message" in data:
-        raise HTTPException(503, f"FMP error: {data['Error Message']}")
+        raise HTTPException(503, f"Market data error: {_sanitize_error(data['Error Message'])}")
     return data
 
 
@@ -642,7 +664,7 @@ def fetch_stock(ticker: str) -> dict:
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(503, f"Market data unavailable for {t}: {exc}")
+            raise HTTPException(503, f"Market data unavailable for {t}: {_sanitize_error(exc)}")
     else:
         # ── yfinance fallback (works locally, unreliable on cloud) ──
         try:
@@ -668,7 +690,7 @@ def fetch_stock(ticker: str) -> dict:
                 "market_cap":       mc,
             }
         except Exception as exc:
-            raise HTTPException(503, f"Market data unavailable for {t}: {exc}. Set FMP_API_KEY on Render for reliable data.")
+            raise HTTPException(503, f"Market data unavailable for {t}: {_sanitize_error(exc)}. Set FMP_API_KEY on Render for reliable data.")
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
@@ -706,6 +728,23 @@ def fetch_deep_data(ticker: str) -> dict:
             result["treasury_stock"]    = bs.get("totalTreasuryStock") or bs.get("treasuryStock") or 0
             result["shares_outstanding"] = bs.get("commonStockSharesOutstanding") or bs.get("sharesOutstanding") or 0
             result["shares_outstanding_prior"] = bs_prior.get("commonStockSharesOutstanding") or bs_prior.get("sharesOutstanding") or 0
+
+        # Income statement: weightedAverageShsOut is the RELIABLE share count source.
+        # FMP balance-sheet commonStockSharesOutstanding is often 0 (bug #4 root cause).
+        is_raw = _fmp_get(f"income-statement?symbol={t}&limit=2&period=annual")
+        if is_raw and isinstance(is_raw, list) and is_raw:
+            inc = is_raw[0]
+            inc_prior = is_raw[1] if len(is_raw) >= 2 else {}
+            shs      = inc.get("weightedAverageShsOutDil") or inc.get("weightedAverageShsOut") or 0
+            shs_pri  = inc_prior.get("weightedAverageShsOutDil") or inc_prior.get("weightedAverageShsOut") or 0
+            # Only override balance-sheet value if it was missing/zero
+            if shs and not result.get("shares_outstanding"):
+                result["shares_outstanding"] = shs
+            if shs_pri and not result.get("shares_outstanding_prior"):
+                result["shares_outstanding_prior"] = shs_pri
+            # Always keep the weighted-average values as the authoritative dilution source
+            if shs:     result["wavg_shares"]       = shs
+            if shs_pri: result["wavg_shares_prior"] = shs_pri
 
         # Cash flow statement: 2 years for dilution trend
         cf_raw = _fmp_get(f"cash-flow-statement?symbol={t}&limit=2&period=annual")
@@ -821,9 +860,20 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     elif buffett_pass <= 2: drivers.append(f"-5: Weak Buffett Balance Sheet — only {buffett_pass}/5 checks passed")
 
     # ── 2. DILUTION (spec format) ─────────────────────────────────────
-    shares     = deep.get("shares_outstanding") or 0
-    shares_pri = deep.get("shares_outstanding_prior") or 0
-    dil_pct    = round((shares - shares_pri) / shares_pri * 100, 1) if shares_pri else None
+    # Priority: weighted-average shares (income statement) — most reliable.
+    # Fallback: balance-sheet shares. Fallback 2: net share issuance sign from cash flow.
+    shares     = deep.get("wavg_shares") or deep.get("shares_outstanding") or 0
+    shares_pri = deep.get("wavg_shares_prior") or deep.get("shares_outstanding_prior") or 0
+    dil_pct    = None
+    if shares_pri and shares:
+        dil_pct = round((shares - shares_pri) / shares_pri * 100, 1)
+    else:
+        # Last-resort: infer direction from net share issuance (negative = buyback)
+        nsi = deep.get("net_share_issuance")
+        if nsi is not None and nsi != 0:
+            # We can't compute exact %, but we can flag direction
+            dil_pct = -0.5 if nsi < 0 else 1.0  # buyback vs issuance indicator
+
     if dil_pct is None:
         dil_status, dil_msg = "gray", "Insufficient Data"
     elif dil_pct < 0:
@@ -1089,6 +1139,7 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         "summary": summary,
         "trap_score": trap_score,
         "value_score": value_score,
+        "buffett_score": buffett_score,
         "reasons": reasons,
         "warnings": warnings,
         "optically_cheap": optically_cheap,
@@ -1110,36 +1161,37 @@ def compute_signal(m: dict, phase: str) -> dict:
         score += pts
         drivers.append(("+" if pts >= 0 else "") + f"{pts}: {why}")
 
-    if rg > 20: add(10, f"Strong revenue growth ({rg:.1f}%)")
-    elif rg > 10: add(5, f"Healthy revenue growth ({rg:.1f}%)")
-    elif rg < 0: add(-10, f"Revenue contracting ({rg:.1f}%)")
+    if rg > 20: add(8, f"Strong revenue growth ({rg:.1f}%)")
+    elif rg > 10: add(4, f"Healthy revenue growth ({rg:.1f}%)")
+    elif rg < 0: add(-8, f"Revenue contracting ({rg:.1f}%)")
 
-    if om > 25: add(10, f"Excellent operating margin ({om:.1f}%)")
-    elif om > 10: add(5, f"Solid operating margin ({om:.1f}%)")
-    elif om < 0: add(-10, f"Operating losses ({om:.1f}%)")
+    if om > 25: add(8, f"Excellent operating margin ({om:.1f}%)")
+    elif om > 10: add(4, f"Solid operating margin ({om:.1f}%)")
+    elif om < 0: add(-8, f"Operating losses ({om:.1f}%)")
 
     if fcf is not None:
-        if fcf > 3: add(10, f"High FCF yield ({fcf:.1f}%)")
-        elif fcf > 1.5: add(5, f"Positive FCF yield ({fcf:.1f}%)")
-        elif fcf < 0: add(-10, f"Negative free cash flow ({fcf:.1f}%)")
+        if fcf > 3: add(8, f"High FCF yield ({fcf:.1f}%)")
+        elif fcf > 1.5: add(4, f"Positive FCF yield ({fcf:.1f}%)")
+        elif fcf < 0: add(-8, f"Negative free cash flow ({fcf:.1f}%)")
 
     if pe:
-        if 0 < pe < 20: add(10, f"Attractive valuation (P/E {pe:.1f}x)")
-        elif pe < 35: add(5, f"Reasonable valuation (P/E {pe:.1f}x)")
-        elif pe > 60: add(-10, f"Stretched valuation (P/E {pe:.1f}x)")
+        if 0 < pe < 20: add(6, f"Attractive valuation (P/E {pe:.1f}x)")
+        elif pe < 35: add(3, f"Reasonable valuation (P/E {pe:.1f}x)")
+        elif pe > 60: add(-6, f"Stretched valuation (P/E {pe:.1f}x)")
 
     if de is not None and de > 2: add(-5, f"Elevated leverage (D/E {de:.1f}x)")
 
     if phase == "GROWTH":
         r40 = rg + om
-        if r40 >= 40: add(10, f"Rule of 40 passed ({r40:.0f})")
-        else: add(-5, f"Rule of 40 missed ({r40:.0f})")
+        if r40 >= 40: add(6, f"Rule of 40 passed ({r40:.0f})")
+        else: add(-4, f"Rule of 40 missed ({r40:.0f})")
     elif phase == "DECLINE":
-        add(-10, "Decline-phase lifecycle risk")
+        add(-8, "Decline-phase lifecycle risk")
     elif phase == "MATURE" and (m.get("dividend_yield") or 0) > 0:
         add(3, "Shareholder returns via dividend")
 
-    score = max(0, min(100, score))
+    # Clamp 1-99: reserve 0/100 for nothing — a real model is never perfectly certain (bug #2)
+    score = max(1, min(99, score))
     rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
     return {"score": score, "recommendation": rec, "drivers": drivers}
 
@@ -1152,7 +1204,6 @@ def compute_signal_with_forensics(m: dict, phase: str, forensics: dict) -> dict:
 
     for d in forensics.get("drivers", []):
         drivers.append(d)
-        # Extract numeric adjustment from driver string
         try:
             prefix = d.split(":")[0].strip()
             pts = int(prefix)
@@ -1160,7 +1211,8 @@ def compute_signal_with_forensics(m: dict, phase: str, forensics: dict) -> dict:
         except (ValueError, IndexError):
             pass
 
-    score = max(0, min(100, score))
+    # Clamp 1-99 (bug #2)
+    score = max(1, min(99, score))
     rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
     return {"score": score, "recommendation": rec, "drivers": drivers}
 
@@ -1191,7 +1243,7 @@ def apply_moat_penalty(sig: dict, moat_assessment: dict) -> dict:
         score += 5
         drivers.append(f"+5: Anti-fragile moat ({antifrag_count}/4 lenses) — structural durability premium")
 
-    score = max(0, min(100, score))
+    score = max(1, min(99, score))
     rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
     return {"score": score, "recommendation": rec, "drivers": drivers}
 
@@ -1322,19 +1374,38 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
     om  = m.get("operating_margin") or 0
     fcf = m.get("fcf_yield")
 
-    # Section 1: Classification + Market Action Profile
+    # Section 1: Classification + Market Action Profile (bug #3 fix)
+    # Map every internal verdict to one of the 3 frontend-valid classifications.
+    # GROWTH_PLAY and NOT_VALUE were previously "NOT APPLICABLE" — now resolved
+    # to NEUTRAL or VALUE STOCK based on quality, with a value/trap-score fallback.
+    value_score = value_verdict.get("value_score", 0)
+    trap_score  = value_verdict.get("trap_score", 0)
+    # buffett_score may be passed via value_verdict or derived; default 0 if absent
+    buffett_score = value_verdict.get("buffett_score", 0)
+
     classification = {
         "VALUE_STOCK": "VALUE STOCK",
         "VALUE_TRAP":  "VALUE TRAP",
-        "GROWTH_PLAY": "NOT APPLICABLE",
-        "NOT_VALUE":   "NOT APPLICABLE",
+        "GROWTH_PLAY": "NEUTRAL",   # priced for growth — not a trap, not classic value
+        "NOT_VALUE":   "NEUTRAL",   # quality compounder at fair price
         "NEUTRAL":     "NEUTRAL",
-    }.get(vv, "NEUTRAL")
+    }.get(vv, None)
 
-    if vv == "VALUE_TRAP":
+    # Fallback: if still unresolved, derive from value vs trap scores
+    if classification not in ("VALUE STOCK", "VALUE TRAP", "NEUTRAL"):
+        if value_score > trap_score + 20:
+            classification = "VALUE STOCK"
+        elif trap_score > value_score + 10:
+            classification = "VALUE TRAP"
+        else:
+            classification = "NEUTRAL"
+
+    # For GROWTH_PLAY/NOT_VALUE quality names, upgrade to VALUE STOCK if fundamentals are strong
+    if vv in ("GROWTH_PLAY", "NOT_VALUE") and buffett_score >= 4 and value_score >= 50:
+        classification = "VALUE STOCK"
+
+    if classification == "VALUE TRAP":
         market_action = "AVOID OR EXIT PROFILE"
-    elif vv in ("GROWTH_PLAY", "NOT_VALUE"):
-        market_action = "NOT APPLICABLE"
     elif rec == "BUY" and score >= 80:
         market_action = "STRONG BUY PROFILE"
     elif rec == "BUY":
@@ -1613,8 +1684,31 @@ def _api_analyze_inner(t: str, visitor_id: str = "", email: str = ""):
         ai = fallback_analysis(t, m, ph["phase"], sig, forensics)
     # Adjust score based on moat quality: Fragile moat lowers conviction, Anti-fragile adds premium
     moat_data = ai.get("moatAssessment")
-    if moat_data:
+    if moat_data and isinstance(moat_data, dict) and "note" not in moat_data:
         sig = apply_moat_penalty(sig, moat_data)
+        # Fix #5: compute an explicit overallRating so the frontend never sees null
+        _ratings = [
+            moat_data.get("liability", {}).get("rating", ""),
+            moat_data.get("businessModel", {}).get("rating", ""),
+            moat_data.get("physicalIntegration", {}).get("rating", ""),
+            moat_data.get("dataGravity", {}).get("rating", ""),
+        ]
+        _frag = sum(1 for r in _ratings if "Fragile" in r and "Anti" not in r)
+        _anti = sum(1 for r in _ratings if "Anti" in r)
+        _robust = sum(1 for r in _ratings if r and "Robust" in r)
+        if _anti >= 2 and _frag == 0:
+            moat_data["overallRating"] = "Anti-fragile"
+        elif _frag >= 2:
+            moat_data["overallRating"] = "Fragile"
+        elif _anti > _frag:
+            moat_data["overallRating"] = "Anti-fragile"
+        elif _frag > _anti:
+            moat_data["overallRating"] = "Fragile"
+        else:
+            moat_data["overallRating"] = "Robust"
+        moat_data["antiFragileCount"] = _anti
+        moat_data["fragileCount"] = _frag
+        moat_data["robustCount"] = _robust
     value_verdict = compute_value_verdict(m, forensics, ph["phase"])
     verdict_card  = format_verdict_card(sig, value_verdict, m)
     payload = {
