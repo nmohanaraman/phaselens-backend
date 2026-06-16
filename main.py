@@ -1074,6 +1074,28 @@ def fetch_stock(ticker: str) -> dict:
                 "roic":             pick((km, "returnOnInvestedCapitalTTM"), pct=True),
                 "eps_history":      eps_history,   # newest→oldest, up to 4yr
             }
+
+            # ── GAP-FILL: FMP gave a price but fundamentals came back sparse
+            #    (common for newer/less-covered tickers on the free tier, e.g.
+            #    NOW, SNOW, QBTS). Fill missing fields from Finnhub so forensics
+            #    can still run instead of collapsing to "insufficient data".
+            _gap_fields = ["revenue_growth", "gross_margin", "operating_margin",
+                           "fcf_yield", "pe_ratio", "roic", "debt_to_equity"]
+            _have = sum(1 for f in _gap_fields if isinstance(data.get(f), (int, float)))
+            if _have < 3 and FINNHUB_API_KEY:
+                fh = _finnhub_fundamentals(t)
+                if fh:
+                    filled = []
+                    for f in _gap_fields:
+                        if not isinstance(data.get(f), (int, float)) and isinstance(fh.get(f), (int, float)):
+                            data[f] = fh[f]; filled.append(f)
+                    # market cap / name too, if FMP lacked them
+                    if (not data.get("market_cap")) and fh.get("market_cap"):
+                        data["market_cap"] = fh["market_cap"]
+                    if filled:
+                        data["_gap_filled_from"] = "finnhub"
+                        data["_gap_filled_fields"] = filled
+                        print(f"ℹ️  {t}: FMP fundamentals sparse, filled {filled} from Finnhub")
         except HTTPException:
             raise
         except (FMPError, Exception) as exc:
@@ -2183,11 +2205,43 @@ def debug_ticker(ticker: str):
     except Exception as e:
         result["sources"]["cnbc"] = {"error": str(e)[:120]}
 
-    # 5. What the actual pipeline returns
+    # 5. FMP fundamentals breakdown — shows WHICH endpoint returns empty.
+    #    This is the diagnostic for "price works but fundamentals are blank".
+    if FMP_API_KEY:
+        fmp_detail = {}
+        for label, path in [
+            ("quote",          f"quote?symbol={fmp_t}"),
+            ("ratios_ttm",     f"ratios-ttm?symbol={fmp_t}"),
+            ("key_metrics_ttm",f"key-metrics-ttm?symbol={fmp_t}"),
+            ("income_stmt",    f"income-statement?symbol={fmp_t}&limit=2&period=annual"),
+        ]:
+            try:
+                resp = _fmp_get(path)
+                if isinstance(resp, list):
+                    fmp_detail[label] = {
+                        "rows": len(resp),
+                        "sample_keys": list(resp[0].keys())[:12] if resp else [],
+                    }
+                else:
+                    fmp_detail[label] = {"type": str(type(resp).__name__), "empty": not bool(resp)}
+            except Exception as e:
+                fmp_detail[label] = {"error": _sanitize_error(e)[:100]}
+        result["fmp_fundamentals_detail"] = fmp_detail
+
+    # 6. What the actual pipeline returns
     try:
         data = fetch_stock(t) if not is_etf(t) else {"note": "ETF — use analyze endpoint"}
         result["pipeline_price"] = data.get("price")
         result["pipeline_source"] = data.get("_price_source", "fmp")
+        # Show which fundamentals actually populated (the gate checks these)
+        result["pipeline_fundamentals"] = {
+            f: data.get(f) for f in
+            ["revenue_growth", "gross_margin", "operating_margin", "fcf_yield", "pe_ratio", "roic"]
+        }
+        _present = sum(1 for f in ["revenue_growth","gross_margin","operating_margin","fcf_yield","pe_ratio","roic"]
+                       if isinstance(data.get(f), (int, float)))
+        result["fundamentals_present_count"] = _present
+        result["would_show_limited"] = _present < 2 or data.get("_price_source") in ("yahoo_chart","yahoo_only")
     except HTTPException as he:
         result["pipeline_error"] = f"HTTP {he.status_code}: {he.detail}"
     except Exception as e:
