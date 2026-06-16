@@ -1219,19 +1219,33 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     }
 
     # ── 3. CASH RUNWAY ENGINE (spec format) ──────────────────────────
-    fcf_abs   = deep.get("fcf") or 0
+    # CRITICAL: distinguish "FCF is missing" from "FCF is zero". Missing data
+    # must NOT be read as healthy. deep.get("fcf") returns None when unknown.
+    fcf_raw   = deep.get("fcf")
     cash      = deep.get("cash") or 0
-    if fcf_abs >= 0:
+    fcf_known = isinstance(fcf_raw, (int, float))
+    fcf_abs   = fcf_raw if fcf_known else 0   # used only for numeric stage math below
+
+    if not fcf_known:
+        # No FCF data → we cannot assess runway. Stay neutral, award NOTHING.
+        checks["runway"] = {
+            "status": "gray",
+            "message": "Insufficient Data — FCF not reported",
+            "months": None,
+            "cash": cash,
+            "fcf": None,
+        }
+    elif fcf_raw >= 0:
         checks["runway"] = {
             "status": "green",
             "message": "Self-Sustaining (Positive FCF)",
             "months": None,
             "cash": cash,
-            "fcf": fcf_abs,
+            "fcf": fcf_raw,
         }
         drivers.append("+5: Positive FCF — no capital raise risk")
     else:
-        monthly_burn = abs(fcf_abs) / 12
+        monthly_burn = abs(fcf_raw) / 12
         months = round(cash / monthly_burn) if monthly_burn else None
         if months is None:
             runway_s, runway_msg = "gray", "Insufficient Data"
@@ -1249,21 +1263,29 @@ def compute_forensics(m: dict, deep: dict) -> dict:
             "message": runway_msg,
             "months": months,
             "cash": cash,
-            "fcf": fcf_abs,
+            "fcf": fcf_raw,
         }
 
     # ── 4. STAGE CLASSIFIER (spec: 4 named nodes) ────────────────────
-    rg = m.get("revenue_growth") or 0
-    om = m.get("operating_margin") or 0
-    if rg > 30 and fcf_abs <= 0:
+    # Only classify when we actually have revenue-growth data. Missing data
+    # must NOT default to "Decline / Distressed" (that's a false negative verdict).
+    rg_raw = m.get("revenue_growth")
+    om_raw = m.get("operating_margin")
+    rg = rg_raw if isinstance(rg_raw, (int, float)) else None
+    om = om_raw if isinstance(om_raw, (int, float)) else None
+    if rg is None:
+        stage_node, stage_status = "Unknown — Insufficient Data", "gray"
+    elif rg > 30 and fcf_abs <= 0 and fcf_known:
         stage_node, stage_status = "Early Stage / Venture",   "blue"
     elif 15 <= rg <= 30:
         stage_node, stage_status = "Growth Phase",            "green"
-    elif 0 <= rg < 15 and om > 5:
+    elif 0 <= rg < 15 and om is not None and om > 5:
         stage_node, stage_status = "Mature / Cash Cow",       "green"
-    else:
+    elif rg < 0 or (om is not None and om < 0):
         stage_node, stage_status = "Decline / Distressed",    "red"
         drivers.append("-10: Decline-phase lifecycle risk")
+    else:
+        stage_node, stage_status = "Unknown — Insufficient Data", "gray"
     checks["stage"] = {
         "current_node": stage_node,
         "status": stage_status,
@@ -1276,18 +1298,31 @@ def compute_forensics(m: dict, deep: dict) -> dict:
 
 # ─────────────────────────── Phase classification ──────────────────────────
 def classify_phase(m: dict) -> dict:
-    rg  = m.get("revenue_growth") or 0
-    om  = m.get("operating_margin") or 0
-    fcf = m.get("fcf_yield") or 0
-    gm  = m.get("gross_margin") or 0
+    # Distinguish missing from zero. PRE_REVENUE must require ACTUAL negative
+    # signals, not absence of data. If revenue growth is unknown, we cannot
+    # classify lifecycle phase at all.
+    rg_raw = m.get("revenue_growth")
+    rg  = rg_raw if isinstance(rg_raw, (int, float)) else None
+    om  = m.get("operating_margin")
+    om  = om if isinstance(om, (int, float)) else None
+    fcf = m.get("fcf_yield")
+    fcf = fcf if isinstance(fcf, (int, float)) else None
+    gm  = m.get("gross_margin")
+    gm  = gm if isinstance(gm, (int, float)) else None
     signals = []
-    if rg <= 0 and gm <= 0:
+
+    if rg is None:
+        # No revenue data → cannot determine phase. Do NOT guess PRE_REVENUE.
+        return {"phase": "UNKNOWN",
+                "signals": ["Insufficient fundamental data to classify lifecycle phase"]}
+
+    if rg <= 0 and gm is not None and gm <= 0:
         phase = "PRE_REVENUE"; signals.append("Negative revenue trend with negative gross margin")
     elif rg > 15:
         phase = "GROWTH"; signals.append(f"Revenue growth {rg:.1f}% exceeds 15% growth threshold")
-    elif rg >= 3 and om > 10 and fcf > 1.5:
+    elif rg >= 3 and om is not None and om > 10 and fcf is not None and fcf > 1.5:
         phase = "MATURE"; signals.append(f"Moderate growth ({rg:.1f}%) with strong margins and FCF")
-    elif rg < 3 and (om < 5 or fcf < 0):
+    elif rg < 3 and ((om is not None and om < 5) or (fcf is not None and fcf < 0)):
         phase = "DECLINE"; signals.append(f"Low growth ({rg:.1f}%) with weak margins/FCF")
     elif rg >= 3:
         phase = "MATURE"; signals.append(f"Steady growth ({rg:.1f}%) with established profitability")
@@ -2039,7 +2074,7 @@ def debug_ticker(ticker: str):
 
 @app.get("/")
 def root():
-    return {"service": "PhaseLens API", "version": "2.3", "status": "ok",
+    return {"service": "PhaseLens API", "version": "2.4-data-integrity", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
             "fmp_enabled": bool(FMP_API_KEY),
             "fmp_calls_today": _fmp_call_count["count"],
@@ -2087,6 +2122,50 @@ def _api_analyze_inner(t: str, visitor_id: str = "", email: str = ""):
     if hit and hit[0] > time.time():
         return hit[1]
     m = fetch_stock(t)
+
+    # ── DATA-SUFFICIENCY GATE ────────────────────────────────────────
+    # If FMP failed and we only have a price (Yahoo-chart/Stooq fallback),
+    # the fundamental fields are all None. We must NOT manufacture a verdict
+    # from missing data (that produced contradictions like "PRE-REVENUE" +
+    # "Stage 4 profitable" on NOW/ServiceNow). Return an honest limited-data card.
+    _core_fields = ["revenue_growth", "gross_margin", "operating_margin",
+                    "fcf_yield", "pe_ratio", "roic"]
+    _present = sum(1 for f in _core_fields if isinstance(m.get(f), (int, float)))
+    _price_only_source = m.get("_price_source") in ("yahoo_chart", "yahoo_only")
+    if _present < 2 or _price_only_source:
+        limited = {
+            "ticker": t, "name": m.get("name") or t, "price": m.get("price"),
+            "phase": "UNKNOWN", "phaseSignals": ["Fundamental data unavailable from data provider"],
+            "score": None, "recommendation": "NO SIGNAL",
+            "signalDrivers": [], "metrics": m,
+            "forensics": {},
+            "data_quality": "LIMITED",
+            "verdictCard": {
+                "section1": {"classification": "INSUFFICIENT DATA",
+                             "market_action_profile": "NO SIGNAL",
+                             "confidence": "NONE", "value_score": None, "trap_score": None},
+                "section2": {"reasoning": ("Live price is available, but the fundamental dataset "
+                                           "(revenue, margins, cash flow, valuation) could not be "
+                                           "retrieved right now. PhaseLens will not generate a "
+                                           "phase, lifecycle, or value-trap verdict without that "
+                                           "data, to avoid producing a misleading signal."),
+                             "supporting": [], "red_flags": []},
+                "section3": {"text": "Re-run analysis in a few minutes — this is usually a temporary "
+                                     "data-provider limit, not a property of the company."},
+                "section4": {"text": "Not financial advice. DYOR."},
+            },
+            "moatAssessment": {"note": "Unavailable — insufficient fundamental data."},
+            "summary": ("Price loaded, but fundamentals are temporarily unavailable. No verdict is "
+                        "shown because scoring on missing data would be misleading."),
+            "phaseRationale": "Lifecycle phase cannot be determined without revenue and margin data.",
+            "strengths": [], "risks": [],
+            "mgmtNote": "",
+            "disclaimer": DISCLAIMER, "complianceShield": COMPLIANCE_SHIELD,
+            "generated_at": now_iso(),
+        }
+        _analysis_cache[t] = (time.time() + 300, limited)  # short 5-min cache; data may return
+        return limited
+
     ph = classify_phase(m)
     deep = fetch_deep_data(t)
     forensics = compute_forensics(m, deep)
