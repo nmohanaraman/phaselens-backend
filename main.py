@@ -2121,7 +2121,7 @@ def debug_ticker(ticker: str):
     t = ticker.upper().strip()
     result = {
         "ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK,
-        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.5-finnhub-fallback",
+        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.6-finnhub-gapfill",
         "sources": {},
     }
     if MOCK:
