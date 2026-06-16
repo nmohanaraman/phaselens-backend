@@ -26,6 +26,7 @@ from pydantic import BaseModel
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 FMP_API_KEY         = os.environ.get("FMP_API_KEY", "")
 FINNHUB_API_KEY     = os.environ.get("FINNHUB_API_KEY", "")
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
 ADMIN_KEY           = os.environ.get("ADMIN_KEY", "")
 ADMIN_EMAIL         = os.environ.get("ADMIN_EMAIL", "nmohanaraman@gmail.com").strip().lower()
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
@@ -679,25 +680,25 @@ def _yahoo_price(ticker: str) -> float | None:
             except Exception:
                 break
 
-    # 3: Stooq — CORRECTED format. US tickers: lowercase + ".us". No query-string 'h'.
-    for sym in (f"{yahoo_t.lower()}.us", f"{t.lower()}.us", t.lower()):
+    # 3: Alpha Vantage GLOBAL_QUOTE — proper API key, not subject to Yahoo IP throttle.
+    #    Free tier is limited (25 req/day) so this is a backstop, not a primary.
+    if ALPHAVANTAGE_API_KEY:
         try:
-            url = f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&e=csv"
-            r = httpx.get(url, timeout=8, headers=headers)
-            if r.status_code == 200 and r.text and "N/D" not in r.text:
-                lines = r.text.strip().split("\n")
-                if len(lines) >= 2:
-                    cols = lines[1].split(",")
-                    # Symbol,Date,Time,Open,High,Low,Close,Volume → Close = index 6
-                    if len(cols) >= 7:
-                        try:
-                            price = float(cols[6])
-                            if price > 0:
-                                return round(price, 4)
-                        except (ValueError, IndexError):
-                            pass
+            url = ("https://www.alphavantage.co/query?function=GLOBAL_QUOTE"
+                   f"&symbol={t}&apikey={ALPHAVANTAGE_API_KEY}")
+            r = httpx.get(url, timeout=10, headers=headers)
+            if r.status_code == 200:
+                gq = (r.json() or {}).get("Global Quote", {}) or {}
+                raw = gq.get("05. price") or gq.get("08. previous close")
+                if raw:
+                    try:
+                        price = float(str(raw))
+                        if price > 0:
+                            return round(price, 4)
+                    except (ValueError, TypeError):
+                        pass
         except Exception:
-            continue
+            pass
 
     # 4: CNBC quote API — separate infrastructure, rarely blocks cloud IPs
     try:
@@ -805,6 +806,93 @@ def _finnhub_fundamentals(ticker: str) -> dict:
         # EPS history for predictability (Finnhub: epsGrowth not raw history; leave empty)
         result["eps_history"] = []
         result["_price_source"] = "finnhub"
+        return result
+    except Exception:
+        return {}
+
+
+def _alphavantage_fundamentals(ticker: str) -> dict:
+    """
+    Full fundamentals from Alpha Vantage (https://www.alphavantage.co).
+    Uses the OVERVIEW endpoint (one call → ~60 fields: margins, ROE, P/E, growth,
+    market cap) plus GLOBAL_QUOTE for the live price. Proper API key, so not
+    subject to Yahoo's cloud-IP throttling.
+
+    NOTE: Alpha Vantage free tier is only 25 requests/DAY — this is a backstop
+    behind FMP and Finnhub, not a primary source. OVERVIEW does not expose FCF
+    or debt/equity directly, so those stay None (honest gray downstream).
+
+    Returns {} on failure so the caller can fall through.
+    """
+    if not ALPHAVANTAGE_API_KEY:
+        return {}
+    t = ticker.upper().strip()
+    base = "https://www.alphavantage.co/query"
+    result = {}
+    try:
+        # 1. OVERVIEW — the rich fundamentals payload
+        ov = httpx.get(f"{base}?function=OVERVIEW&symbol={t}&apikey={ALPHAVANTAGE_API_KEY}",
+                       timeout=12)
+        od = ov.json() if ov.status_code == 200 else {}
+        # AV returns {} or a {"Note":...}/{"Information":...} envelope when
+        # rate-limited or when the symbol is unsupported.
+        if not isinstance(od, dict) or not od.get("Symbol"):
+            return {}
+
+        def num(key):
+            v = od.get(key)
+            if v in (None, "None", "-", ""):
+                return None
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+
+        # 2. GLOBAL_QUOTE — live price
+        price = None
+        try:
+            gq = httpx.get(f"{base}?function=GLOBAL_QUOTE&symbol={t}&apikey={ALPHAVANTAGE_API_KEY}",
+                           timeout=10)
+            if gq.status_code == 200:
+                q = (gq.json() or {}).get("Global Quote", {}) or {}
+                raw = q.get("05. price") or q.get("08. previous close")
+                if raw:
+                    price = float(str(raw))
+        except Exception:
+            price = None
+        if not price or price <= 0:
+            # Fall back to AV's 52-week-based fields are not a price; bail if no quote.
+            return {}
+        result["price"] = round(float(price), 4)
+        result["name"]  = od.get("Name") or t
+        result["sector"] = od.get("Sector") or "Unknown"
+        result["market_cap"] = num("MarketCapitalization") or 0
+
+        # AV margins/growth are decimals (0.25 = 25%); convert to percent.
+        net_margin = num("ProfitMargin")
+        op_margin  = num("OperatingMarginTTM")
+        rev_growth = num("QuarterlyRevenueGrowthYOY")
+        roe        = num("ReturnOnEquityTTM")
+        rev_ttm    = num("RevenueTTM")
+        gross_ttm  = num("GrossProfitTTM")
+
+        result["pe_ratio"]         = num("PERatio")
+        result["operating_margin"] = round(op_margin * 100, 2) if op_margin is not None else None
+        result["revenue_growth"]   = round(rev_growth * 100, 2) if rev_growth is not None else None
+        # Gross margin: compute from GrossProfitTTM / RevenueTTM when both present.
+        if gross_ttm is not None and rev_ttm and rev_ttm > 0:
+            result["gross_margin"] = round(gross_ttm / rev_ttm * 100, 2)
+        else:
+            result["gross_margin"] = None
+        # ROIC: AV gives ROE/ROA, not ROIC — use ROE as a proxy (as with Finnhub).
+        result["roic"]             = round(roe * 100, 2) if roe is not None else None
+        dy = num("DividendYield")
+        result["dividend_yield"]   = round(dy * 100, 2) if dy is not None else 0.0
+        # AV OVERVIEW does not expose FCF or debt/equity → leave None (honest gray).
+        result["fcf_yield"]        = None
+        result["debt_to_equity"]   = None
+        result["eps_history"]      = []
+        result["_price_source"]    = "alphavantage"
         return result
     except Exception:
         return {}
@@ -986,15 +1074,17 @@ def fetch_stock(ticker: str) -> dict:
             # 1. Quote: real-time price + name + market cap (normalized ticker)
             quote_raw = _fmp_get(f"quote?symbol={fmp_t}")
 
-            # ── If FMP quote is empty, try Finnhub (full fundamentals, proper
-            #    API key, no Yahoo IP-throttle), then Yahoo as a further fallback ──
+            # ── If FMP quote is empty, try keyed providers (Finnhub, Alpha
+            #    Vantage — full fundamentals, no Yahoo IP-throttle), then Yahoo ──
             if not quote_raw or not isinstance(quote_raw, list) or not quote_raw:
-                fh_data = _finnhub_fundamentals(t)
-                if fh_data.get("price"):
-                    print(f"ℹ️  {t}: FMP quote empty, using Finnhub fundamentals: ${fh_data['price']}")
-                    fh_data["ticker"] = t
-                    _stock_cache[t] = (time.time() + STOCK_TTL, fh_data)
-                    return fh_data
+                for _src_name, _src_fn in (("Finnhub", _finnhub_fundamentals),
+                                           ("AlphaVantage", _alphavantage_fundamentals)):
+                    cand = _src_fn(t)
+                    if cand.get("price"):
+                        print(f"ℹ️  {t}: FMP quote empty, using {_src_name}: ${cand['price']}")
+                        cand["ticker"] = t
+                        _stock_cache[t] = (time.time() + STOCK_TTL, cand)
+                        return cand
                 yf_data = _yahoo_fundamentals(t)
                 if yf_data.get("price"):
                     print(f"ℹ️  {t}: FMP quote empty, using Yahoo fundamentals: ${yf_data['price']}")
@@ -1082,36 +1172,54 @@ def fetch_stock(ticker: str) -> dict:
             _gap_fields = ["revenue_growth", "gross_margin", "operating_margin",
                            "fcf_yield", "pe_ratio", "roic", "debt_to_equity"]
             _have = sum(1 for f in _gap_fields if isinstance(data.get(f), (int, float)))
-            if _have < 3 and FINNHUB_API_KEY:
-                fh = _finnhub_fundamentals(t)
-                if fh:
-                    filled = []
+            if _have < 3 and (FINNHUB_API_KEY or ALPHAVANTAGE_API_KEY):
+                filled = []
+                _sources_used = []
+                # Try Finnhub first (60/min, richer), then Alpha Vantage (25/day).
+                for _src_name, _src_fn, _src_key in (
+                    ("finnhub", _finnhub_fundamentals, FINNHUB_API_KEY),
+                    ("alphavantage", _alphavantage_fundamentals, ALPHAVANTAGE_API_KEY),
+                ):
+                    if not _src_key:
+                        continue
+                    # Stop early if we've already filled enough to run analysis.
+                    _now_have = sum(1 for f in _gap_fields if isinstance(data.get(f), (int, float)))
+                    if _now_have >= 3:
+                        break
+                    src = _src_fn(t)
+                    if not src:
+                        continue
                     for f in _gap_fields:
-                        if not isinstance(data.get(f), (int, float)) and isinstance(fh.get(f), (int, float)):
-                            data[f] = fh[f]; filled.append(f)
-                    # market cap / name too, if FMP lacked them
-                    if (not data.get("market_cap")) and fh.get("market_cap"):
-                        data["market_cap"] = fh["market_cap"]
-                    if filled:
-                        data["_gap_filled_from"] = "finnhub"
-                        data["_gap_filled_fields"] = filled
-                        print(f"ℹ️  {t}: FMP fundamentals sparse, filled {filled} from Finnhub")
+                        if not isinstance(data.get(f), (int, float)) and isinstance(src.get(f), (int, float)):
+                            data[f] = src[f]; filled.append(f)
+                    if (not data.get("market_cap")) and src.get("market_cap"):
+                        data["market_cap"] = src["market_cap"]
+                    if src.get("filled_any") or any(isinstance(src.get(f), (int, float)) for f in _gap_fields):
+                        _sources_used.append(_src_name)
+                if filled:
+                    data["_gap_filled_from"] = ",".join(dict.fromkeys(_sources_used)) or "fallback"
+                    data["_gap_filled_fields"] = filled
+                    print(f"ℹ️  {t}: FMP fundamentals sparse, filled {filled} from {data['_gap_filled_from']}")
         except HTTPException:
             raise
         except (FMPError, Exception) as exc:
             # FMP failed (rate limit, 402, format mismatch, network) — fall through.
-            # Order: Finnhub (full fundamentals, proper API key) → Yahoo → 404.
-            # Finnhub is preferred because it isn't subject to Yahoo's cloud-IP
-            # throttling and returns full fundamentals so forensics can run.
-            fh_data = _finnhub_fundamentals(t)
-            if fh_data.get("price"):
-                print(f"ℹ️  {t}: FMP failed ({_sanitize_error(exc)}), using Finnhub: ${fh_data['price']}")
-                fh_data["ticker"] = t
-                data = fh_data
-            else:
+            # Order: Finnhub → Alpha Vantage → Yahoo → 404. The keyed providers
+            # (Finnhub, Alpha Vantage) come first because they aren't subject to
+            # Yahoo's cloud-IP throttling and return full fundamentals.
+            data = None
+            for _src_name, _src_fn in (("Finnhub", _finnhub_fundamentals),
+                                       ("AlphaVantage", _alphavantage_fundamentals)):
+                cand = _src_fn(t)
+                if cand.get("price"):
+                    print(f"ℹ️  {t}: FMP failed ({_sanitize_error(exc)}), using {_src_name}: ${cand['price']}")
+                    cand["ticker"] = t
+                    data = cand
+                    break
+            if data is None:
                 yf_data = _yahoo_fundamentals(t)
                 if yf_data.get("price"):
-                    print(f"ℹ️  {t}: FMP+Finnhub failed, using Yahoo fundamentals: ${yf_data['price']}")
+                    print(f"ℹ️  {t}: FMP+Finnhub+AV failed, using Yahoo fundamentals: ${yf_data['price']}")
                     yf_data["ticker"] = t
                     data = yf_data
                 else:
@@ -1329,8 +1437,16 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     if dil_pct is None:
         dil_status, dil_msg = "gray", "Insufficient Data"
     elif dil_pct < 0:
-        dil_status, dil_msg = "green",  "Accretive (Buying Back Shares)"
-        drivers.append(f"+5: Share buyback — float reduced {abs(dil_pct):.1f}% YoY")
+        # Share count fell — but cross-check the cash-flow issuance signal. If the
+        # company is a NET issuer of stock (issued more than it repurchased), the
+        # wavg-share drop is NOT a genuine buyback. Don't award an "Accretive"
+        # green badge that contradicts net issuance.
+        nsi = deep.get("net_share_issuance")
+        if nsi is not None and nsi > 0:
+            dil_status, dil_msg = "gray", "Mixed Signal — share count fell but net stock issuance positive"
+        else:
+            dil_status, dil_msg = "green",  "Accretive (Buying Back Shares)"
+            drivers.append(f"+5: Share buyback — float reduced {abs(dil_pct):.1f}% YoY")
     elif dil_pct <= 2:
         dil_status, dil_msg = "gray",   "Neutral (Standard Employee Comp)"
     elif dil_pct <= 10:
@@ -1473,14 +1589,21 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     """
     fc = forensics.get("checks", {})
     pe  = m.get("pe_ratio")
-    rg  = m.get("revenue_growth") or 0
-    om  = m.get("operating_margin") or 0
+    _rg_raw = m.get("revenue_growth")
+    _om_raw = m.get("operating_margin")
+    rg  = _rg_raw if isinstance(_rg_raw, (int, float)) else None
+    om  = _om_raw if isinstance(_om_raw, (int, float)) else None
 
     # Support both old key structure and new forensics key structure
     bs            = fc.get("buffett_score") or fc.get("buffett") or {}
     buffett_score = bs.get("pass") or bs.get("total_pass") or 0
     dil           = fc.get("dilution") or {}
-    dilution_flag = dil.get("status") or dil.get("flag") or "CLEAN"
+    # Do NOT default missing dilution to "CLEAN" — absent data must not be
+    # rewarded as a clean capital structure. Use a distinct UNKNOWN sentinel.
+    _dil_status   = dil.get("status") or dil.get("flag")
+    _dil_yoy      = dil.get("yoy_change")
+    dilution_known = bool(_dil_status) and (_dil_yoy not in (None, "N/A"))
+    dilution_flag = _dil_status if _dil_status else "UNKNOWN"
     dilution_pct  = 0
     _dil_raw = dil.get("yoy_change") or dil.get("dilution_pct") or 0
     if isinstance(_dil_raw, str):
@@ -1500,8 +1623,8 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     # Retained earnings: check from EPS predictability trend as proxy
     eps_check     = fc.get("eps_predictability") or {}
     retained_grow = eps_check.get("status") == "green"
-    # Treasury: check dilution status (buyback = treasury stock present)
-    has_treasury  = dilution_flag in ("green", "BUYBACK", "CLEAN")
+    # Treasury/buyback signal: only a genuine green (accretive) status counts.
+    has_treasury  = dilution_known and dilution_flag == "green"
     preferred     = 0  # Not separately tracked in new forensics
 
     # Is it optically "cheap"? (traditional value screen)
@@ -1541,11 +1664,11 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         trap_score += 10
         warnings.append(f"⚠️ Preferred stock ${preferred/1e6:.0f}M — hybrid financing signals balance sheet stress")
 
-    if rg < -5:
+    if rg is not None and rg < -5:
         trap_score += 20
         warnings.append(f"🚨 Revenue contracting {rg:.1f}% — fundamental demand destruction, not cyclical dip")
 
-    if om < -20:
+    if om is not None and om < -20:
         trap_score += 15
         warnings.append(f"⚠️ Deep operating losses ({om:.1f}%) — no visible path to profitability")
 
@@ -1558,9 +1681,12 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         value_score += 25
         reasons.append(f"✅ Fortress balance sheet {buffett_score}/5 Buffett checks — financial durability intact")
 
-    if dilution_flag in ("CLEAN", "BUYBACK"):
+    # Forensics dilution status vocabulary is green (buyback/accretive) / gray
+    # (neutral or insufficient) / red (issuing/toxic). Only a genuine buyback
+    # (green) earns value credit — neutral and unknown do NOT.
+    if dilution_known and dilution_flag == "green":
         value_score += 20
-        reasons.append(f"✅ {'Share buybacks reducing float' if dilution_flag == 'BUYBACK' else 'Clean capital structure — no dilution'}")
+        reasons.append("✅ Share buybacks reducing float — capital returned to shareholders")
 
     if retained_grow:
         value_score += 15
@@ -1570,11 +1696,15 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         value_score += 10
         reasons.append("✅ Treasury stock present — management returning capital to shareholders")
 
-    if stage >= 3:
+    # Stage 3 = Mature is the only "established profitable" stage. Stage 4 = Decline
+    # is the OPPOSITE — it must never be credited as "profitable / no raise risk".
+    # Also require actual evidence of profitability (positive operating margin),
+    # not merely the stage label, to avoid false positives.
+    if stage == 3 and om is not None and om > 0:
         value_score += 15
-        reasons.append(f"✅ Stage {stage} profitable business — no capital raise risk")
+        reasons.append(f"✅ Mature, established business ({om:.1f}% operating margin) — no capital raise risk")
 
-    if om > 15:
+    if om is not None and om > 15:
         value_score += 10
         reasons.append(f"✅ Strong operating margin {om:.1f}% — pricing power and efficiency intact")
 
@@ -1582,14 +1712,14 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         value_score += 10
         reasons.append(f"✅ Net cash positive — company can self-fund through downturns")
 
-    if rg > 3 and om > 10:
+    if rg is not None and om is not None and rg > 3 and om > 10:
         value_score += 10
         reasons.append(f"✅ Growing and profitable ({rg:.1f}% revenue, {om:.1f}% margin) — recovery catalyst present")
 
     # ── Final verdict ────────────────────────────────────────────────────
     if phase == "GROWTH" and pe and pe > 40:
         verdict = "GROWTH_PLAY"
-        confidence = "HIGH" if buffett_score >= 3 and dilution_flag in ("CLEAN","BUYBACK") else "MEDIUM"
+        confidence = "HIGH" if buffett_score >= 3 and dilution_known and dilution_flag == "green" else "MEDIUM"
         summary = (f"Not a value play — priced for growth (P/E {pe:.1f}x). "
                    f"Evaluate on Rule of 40 and revenue quality, not traditional value metrics.")
     elif trap_score >= 40 and trap_score > value_score:
@@ -1606,7 +1736,8 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         # High P/E only means NOT_VALUE if quality metrics justify the premium:
         # strong balance sheet (Buffett ≥ 3/5) AND positive growth AND healthy margin.
         # High P/E + poor fundamentals = elevated risk, not a quality compounder.
-        is_quality_justified = buffett_score >= 3 and rg > 0 and om > 10
+        is_quality_justified = (buffett_score >= 3 and rg is not None and rg > 0
+                                and om is not None and om > 10)
         if is_quality_justified:
             verdict = "NOT_VALUE"
             confidence = "HIGH"
@@ -1630,6 +1761,18 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         verdict = "NEUTRAL"
         confidence = "LOW"
         summary = "Mixed signals — insufficient evidence for clear value or trap classification."
+
+    # ── FINAL CONSISTENCY GUARD ──────────────────────────────────────────
+    # A VALUE_TRAP or DECLINE-phase verdict must never carry green "profitable /
+    # no capital raise risk / self-fund" supporting reasons — that's the exact
+    # contradiction users flagged ("VALUE TRAP" + "Stage 4 profitable business").
+    # Strip any positive reason that asserts profitability or capital safety
+    # when the overall picture is deteriorating.
+    if verdict == "VALUE_TRAP" or phase == "DECLINE" or stage == 4:
+        _contradictory = ("no capital raise risk", "profitable", "self-fund",
+                          "Net cash positive", "recovery catalyst")
+        reasons = [r for r in reasons
+                   if not any(frag.lower() in r.lower() for frag in _contradictory)]
 
     return {
         "verdict": verdict,
@@ -2121,7 +2264,7 @@ def debug_ticker(ticker: str):
     t = ticker.upper().strip()
     result = {
         "ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK,
-        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.6-finnhub-gapfill",
+        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.7-alphavantage-nofalsepos",
         "sources": {},
     }
     if MOCK:
@@ -2175,21 +2318,27 @@ def debug_ticker(ticker: str):
         except Exception as e:
             result["sources"][f"yahoo_chart_{i}"] = {"error": str(e)[:120]}
 
-    # 3. Stooq (corrected format)
-    try:
-        sym = f"{yahoo_t.lower()}.us"
-        r = httpx.get(f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&e=csv", timeout=8, headers=hdrs)
-        price = None
-        if r.status_code == 200 and r.text and "N/D" not in r.text:
-            lines = r.text.strip().split("\n")
-            if len(lines) >= 2:
-                cols = lines[1].split(",")
-                if len(cols) >= 7:
-                    try: price = float(cols[6])
-                    except (ValueError, IndexError): pass
-        result["sources"]["stooq"] = {"http": r.status_code, "price": price, "queried_as": sym}
-    except Exception as e:
-        result["sources"]["stooq"] = {"error": str(e)[:120]}
+    # 3. Alpha Vantage (replaces Stooq) — tests OVERVIEW fundamentals + GLOBAL_QUOTE
+    if ALPHAVANTAGE_API_KEY:
+        try:
+            ov = httpx.get("https://www.alphavantage.co/query"
+                           f"?function=OVERVIEW&symbol={t}&apikey={ALPHAVANTAGE_API_KEY}", timeout=12)
+            od = ov.json() if ov.status_code == 200 else {}
+            n_fields = len(od) if isinstance(od, dict) and od.get("Symbol") else 0
+            note = None
+            if isinstance(od, dict) and (od.get("Note") or od.get("Information")):
+                note = "rate-limited (25/day free tier) or unsupported symbol"
+            gq = httpx.get("https://www.alphavantage.co/query"
+                           f"?function=GLOBAL_QUOTE&symbol={t}&apikey={ALPHAVANTAGE_API_KEY}", timeout=10)
+            avprice = None
+            if gq.status_code == 200:
+                avprice = (gq.json() or {}).get("Global Quote", {}).get("05. price")
+            result["sources"]["alphavantage"] = {"http": ov.status_code, "price": avprice,
+                                                 "fundamentals_count": n_fields, "note": note}
+        except Exception as e:
+            result["sources"]["alphavantage"] = {"error": str(e)[:120]}
+    else:
+        result["sources"]["alphavantage"] = {"reachable": False, "error": "ALPHAVANTAGE_API_KEY not set"}
 
     # 4. CNBC
     try:
@@ -2252,12 +2401,13 @@ def debug_ticker(ticker: str):
 
 @app.get("/")
 def root():
-    return {"service": "PhaseLens API", "version": "2.5-finnhub", "status": "ok",
+    return {"service": "PhaseLens API", "version": "2.7-alphavantage", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
             "fmp_enabled": bool(FMP_API_KEY),
             "fmp_calls_today": _fmp_call_count["count"],
             "fmp_calls_note": "observability only — does not block requests; Finnhub+Yahoo fallback active on FMP failure",
             "finnhub_fallback": "enabled" if FINNHUB_API_KEY else "not configured (set FINNHUB_API_KEY)",
+            "alphavantage_fallback": "enabled" if ALPHAVANTAGE_API_KEY else "not configured (set ALPHAVANTAGE_API_KEY)",
             "yahoo_fallback": "enabled",
             "auth_enabled": bool(FIREBASE_PROJECT_ID)}
 
