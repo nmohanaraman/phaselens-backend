@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 FMP_API_KEY         = os.environ.get("FMP_API_KEY", "")
+FINNHUB_API_KEY     = os.environ.get("FINNHUB_API_KEY", "")
 ADMIN_KEY           = os.environ.get("ADMIN_KEY", "")
 ADMIN_EMAIL         = os.environ.get("ADMIN_EMAIL", "nmohanaraman@gmail.com").strip().lower()
 FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
@@ -717,6 +718,98 @@ def _yahoo_price(ticker: str) -> float | None:
     return None
 
 
+def _finnhub_fundamentals(ticker: str) -> dict:
+    """
+    Full fundamentals from Finnhub (https://finnhub.io). Free tier: 60 calls/min,
+    proper API key — NOT subject to Yahoo's cloud-IP throttling. This is the
+    primary fallback when FMP is rate-limited.
+
+    Uses three endpoints:
+      /quote            → real-time price
+      /stock/profile2   → name, market cap, sector
+      /stock/metric     → ~117 fundamental metrics (margins, ROIC, P/E, FCF, D/E)
+
+    Returns {} on failure so the caller can fall through to Yahoo/Stooq.
+    Ticker normalized: BRK.B → BRK.B works on Finnhub (it uses dot notation).
+    """
+    if not FINNHUB_API_KEY:
+        return {}
+    t = ticker.upper().strip()
+    base = "https://finnhub.io/api/v1"
+    tok = {"token": FINNHUB_API_KEY}
+    result = {}
+    try:
+        # 1. Quote (price)
+        q = httpx.get(f"{base}/quote", params=dict(symbol=t, **tok), timeout=10)
+        if q.status_code == 429:
+            return {}  # rate limited → let caller try next source
+        price = None
+        if q.status_code == 200:
+            qd = q.json()
+            price = qd.get("c")  # current price
+        if not price or float(price) <= 0:
+            return {}  # no price → not useful
+        result["price"] = round(float(price), 4)
+
+        # 2. Profile (name, market cap, sector)
+        try:
+            p = httpx.get(f"{base}/stock/profile2", params=dict(symbol=t, **tok), timeout=10)
+            if p.status_code == 200:
+                pd = p.json()
+                result["name"] = pd.get("name") or t
+                # Finnhub marketCapitalization is in millions
+                mc = pd.get("marketCapitalization")
+                result["market_cap"] = float(mc) * 1e6 if mc else 0
+                result["sector"] = pd.get("finnhubIndustry") or "Unknown"
+            else:
+                result["name"] = t; result["market_cap"] = 0
+        except Exception:
+            result["name"] = t; result["market_cap"] = 0
+
+        # 3. Metrics (the rich fundamentals payload — ~117 fields)
+        m = httpx.get(f"{base}/stock/metric", params=dict(symbol=t, metric="all", **tok), timeout=10)
+        met = {}
+        if m.status_code == 200:
+            met = (m.json() or {}).get("metric", {}) or {}
+
+        def g(*keys):
+            """First non-null numeric value among candidate Finnhub metric keys."""
+            for k in keys:
+                v = met.get(k)
+                if isinstance(v, (int, float)):
+                    return v
+            return None
+
+        # Map Finnhub metric names → engine fields.
+        # Margins on Finnhub are already percentages (e.g. 79.0 = 79%).
+        result["gross_margin"]     = g("grossMarginTTM", "grossMarginAnnual")
+        result["operating_margin"] = g("operatingMarginTTM", "operatingMarginAnnual")
+        result["pe_ratio"]         = g("peTTM", "peBasicExclExtraTTM", "peAnnual")
+        result["revenue_growth"]   = g("revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy",
+                                       "revenueGrowth5Y", "revenueGrowthTTM")
+        # ROIC: prefer true ROIC, fall back to ROE
+        result["roic"]             = g("roiTTM", "roiAnnual", "roeTTM", "roeAnnual")
+        # Dividend yield (Finnhub gives a percentage)
+        result["dividend_yield"]   = g("dividendYieldIndicatedAnnual", "currentDividendYieldTTM") or 0.0
+        # D/E: Finnhub reports as a ratio already (e.g. 1.8)
+        result["debt_to_equity"]   = g("totalDebt/totalEquityQuarterly",
+                                       "totalDebt/totalEquityAnnual", "longTermDebt/equityQuarterly")
+        # FCF yield: Finnhub doesn't give yield directly; derive from FCF/share & price,
+        # else from FCF margin. Best-effort — None if not derivable.
+        fcf_share = g("freeCashFlowPerShareTTM", "freeCashFlowPerShareAnnual")
+        if fcf_share is not None and result["price"] > 0:
+            result["fcf_yield"] = round(fcf_share / result["price"] * 100, 2)
+        else:
+            result["fcf_yield"] = g("freeCashFlowYieldTTM")  # rarely present
+
+        # EPS history for predictability (Finnhub: epsGrowth not raw history; leave empty)
+        result["eps_history"] = []
+        result["_price_source"] = "finnhub"
+        return result
+    except Exception:
+        return {}
+
+
 def _yahoo_fundamentals(ticker: str) -> dict:
     """
     Full fundamentals fallback from Yahoo Finance when FMP fails entirely.
@@ -893,15 +986,22 @@ def fetch_stock(ticker: str) -> dict:
             # 1. Quote: real-time price + name + market cap (normalized ticker)
             quote_raw = _fmp_get(f"quote?symbol={fmp_t}")
 
-            # ── If FMP quote is empty, use FULL Yahoo Finance fundamentals ──
+            # ── If FMP quote is empty, try Finnhub (full fundamentals, proper
+            #    API key, no Yahoo IP-throttle), then Yahoo as a further fallback ──
             if not quote_raw or not isinstance(quote_raw, list) or not quote_raw:
+                fh_data = _finnhub_fundamentals(t)
+                if fh_data.get("price"):
+                    print(f"ℹ️  {t}: FMP quote empty, using Finnhub fundamentals: ${fh_data['price']}")
+                    fh_data["ticker"] = t
+                    _stock_cache[t] = (time.time() + STOCK_TTL, fh_data)
+                    return fh_data
                 yf_data = _yahoo_fundamentals(t)
                 if yf_data.get("price"):
                     print(f"ℹ️  {t}: FMP quote empty, using Yahoo fundamentals: ${yf_data['price']}")
                     yf_data["ticker"] = t
                     _stock_cache[t] = (time.time() + STOCK_TTL, yf_data)
                     return yf_data
-                # Yahoo also failed → final safety net (404, never expose key)
+                # All sources failed → final safety net (404, never expose key)
                 raise HTTPException(404, f"Market data unavailable for {t}. Please verify the symbol.")
             q = quote_raw[0]
 
@@ -977,17 +1077,24 @@ def fetch_stock(ticker: str) -> dict:
         except HTTPException:
             raise
         except (FMPError, Exception) as exc:
-            # FMP failed (rate limit, 402, format mismatch, network) — fall through
-            # to the FULL Yahoo Finance fundamentals (Bug B fix). This is the path
-            # that handles GOOG/BRK.B format mismatches that FMP rejects (Bug C).
-            yf_data = _yahoo_fundamentals(t)
-            if yf_data.get("price"):
-                print(f"ℹ️  {t}: FMP failed ({_sanitize_error(exc)}), using Yahoo fundamentals: ${yf_data['price']}")
-                yf_data["ticker"] = t
-                data = yf_data
+            # FMP failed (rate limit, 402, format mismatch, network) — fall through.
+            # Order: Finnhub (full fundamentals, proper API key) → Yahoo → 404.
+            # Finnhub is preferred because it isn't subject to Yahoo's cloud-IP
+            # throttling and returns full fundamentals so forensics can run.
+            fh_data = _finnhub_fundamentals(t)
+            if fh_data.get("price"):
+                print(f"ℹ️  {t}: FMP failed ({_sanitize_error(exc)}), using Finnhub: ${fh_data['price']}")
+                fh_data["ticker"] = t
+                data = fh_data
             else:
-                # Final safety net: only now do we fail — with a clean 404, never the key
-                raise HTTPException(404, f"Market data unavailable for {t}. Please verify the symbol.")
+                yf_data = _yahoo_fundamentals(t)
+                if yf_data.get("price"):
+                    print(f"ℹ️  {t}: FMP+Finnhub failed, using Yahoo fundamentals: ${yf_data['price']}")
+                    yf_data["ticker"] = t
+                    data = yf_data
+                else:
+                    # Final safety net: clean 404, never the key
+                    raise HTTPException(404, f"Market data unavailable for {t}. Please verify the symbol.")
     else:
         # ── yfinance fallback (works locally, unreliable on cloud) ──
         try:
@@ -1992,7 +2099,7 @@ def debug_ticker(ticker: str):
     t = ticker.upper().strip()
     result = {
         "ticker": t, "is_etf": is_etf(t), "mock_mode": MOCK,
-        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.3-ticker-norm-multi-source",
+        "fmp_enabled": bool(FMP_API_KEY), "code_version": "2.5-finnhub-fallback",
         "sources": {},
     }
     if MOCK:
@@ -2017,6 +2124,23 @@ def debug_ticker(ticker: str):
                                          "error": _sanitize_error(e)[:120]}
     else:
         result["sources"]["fmp"] = {"reachable": False, "error": "FMP_API_KEY not set"}
+
+    # 1b. Finnhub (primary fallback — full fundamentals, proper API key)
+    if FINNHUB_API_KEY:
+        try:
+            fq = httpx.get("https://finnhub.io/api/v1/quote",
+                           params={"symbol": t, "token": FINNHUB_API_KEY}, timeout=10)
+            fprice = fq.json().get("c") if fq.status_code == 200 else None
+            # Also check the metric endpoint actually returns fundamentals
+            fm = httpx.get("https://finnhub.io/api/v1/stock/metric",
+                           params={"symbol": t, "metric": "all", "token": FINNHUB_API_KEY}, timeout=10)
+            n_metrics = len((fm.json() or {}).get("metric", {})) if fm.status_code == 200 else 0
+            result["sources"]["finnhub"] = {"http": fq.status_code, "price": fprice,
+                                             "fundamentals_count": n_metrics}
+        except Exception as e:
+            result["sources"]["finnhub"] = {"error": str(e)[:120]}
+    else:
+        result["sources"]["finnhub"] = {"reachable": False, "error": "FINNHUB_API_KEY not set"}
 
     # 2. Yahoo chart endpoints
     for i, host in enumerate(("query1.finance.yahoo.com", "query2.finance.yahoo.com"), 1):
@@ -2074,11 +2198,12 @@ def debug_ticker(ticker: str):
 
 @app.get("/")
 def root():
-    return {"service": "PhaseLens API", "version": "2.4-data-integrity", "status": "ok",
+    return {"service": "PhaseLens API", "version": "2.5-finnhub", "status": "ok",
             "mock_mode": MOCK, "ai_enabled": bool(GROQ_API_KEY),
             "fmp_enabled": bool(FMP_API_KEY),
             "fmp_calls_today": _fmp_call_count["count"],
-            "fmp_calls_note": "observability only — does not block requests; Yahoo fallback active on FMP failure",
+            "fmp_calls_note": "observability only — does not block requests; Finnhub+Yahoo fallback active on FMP failure",
+            "finnhub_fallback": "enabled" if FINNHUB_API_KEY else "not configured (set FINNHUB_API_KEY)",
             "yahoo_fallback": "enabled",
             "auth_enabled": bool(FIREBASE_PROJECT_ID)}
 
