@@ -12,14 +12,14 @@ Env vars (set these on Render):
   ALLOWED_ORIGINS      optional — comma-separated extra CORS origins
   PHASELENS_MOCK       optional — "1" = sample market data (testing without network)
 """
-import os, json, time, sqlite3
+import os, json, time, sqlite3, re
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 
 import httpx
 import jwt as pyjwt
 from cryptography.x509 import load_pem_x509_certificate
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -48,7 +48,7 @@ _origins += [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_origin_regex=r"https://.*\.netlify\.app",
+    allow_origin_regex=r"https://([a-z0-9-]+--)?phaselens\.netlify\.app",
     allow_methods=["*"], allow_headers=["*"],
 )
 
@@ -71,7 +71,11 @@ def db():
         conn.close()
 
 def q(sql):
-    return sql.replace("?", "%s") if IS_PG else sql
+    # SQLite uses ? placeholders; psycopg2 uses %s AND treats any literal % as a
+    # format char, so literal % (e.g. LIKE 'signin%') must be doubled to %%.
+    if not IS_PG:
+        return sql
+    return sql.replace("%", "%%").replace("?", "%s")
 
 def init_db():
     with db() as conn:
@@ -179,6 +183,35 @@ MOCK_DATA = {
     "revenue_growth": 15.0, "dividend_yield": 0.5, "debt_to_equity": 0.8,
     "market_cap": 50_000_000_000,
 }
+
+_VALID_TICKER = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$")
+def validate_ticker(raw: str) -> str:
+    """Uppercase, strip, and allow only real ticker chars. Blocks URL/param
+    injection into the FMP request and rejects junk that would burn API quota."""
+    t = (raw or "").upper().strip()
+    if not _VALID_TICKER.match(t):
+        raise HTTPException(400, "Invalid ticker symbol")
+    return t
+
+_RL_MAX    = int(os.environ.get("ANALYZE_RATE_MAX", "30"))     # new analyses
+_RL_WINDOW = int(os.environ.get("ANALYZE_RATE_WINDOW", "600")) # per N seconds
+_rl_buckets: dict = {}
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+def _rate_limit(key: str):
+    now = time.time()
+    arr = [ts for ts in _rl_buckets.get(key, []) if ts > now - _RL_WINDOW]
+    if len(arr) >= _RL_MAX:
+        raise HTTPException(429, "Rate limit reached — please wait a few minutes before analyzing more tickers.")
+    arr.append(now)
+    _rl_buckets[key] = arr
+    if len(_rl_buckets) > 5000:  # opportunistic cleanup
+        for k in list(_rl_buckets.keys()):
+            if not _rl_buckets[k] or _rl_buckets[k][-1] < now - _RL_WINDOW:
+                _rl_buckets.pop(k, None)
 
 def _fmp_get(path: str) -> dict:
     """Call FMP API and return parsed JSON. Raises HTTPException on failure."""
@@ -1005,11 +1038,12 @@ def api_stock(ticker: str):
     return fetch_stock(ticker)
 
 @app.get("/api/analyze/{ticker}")
-def api_analyze(ticker: str, visitor_id: str = "", email: str = ""):
-    t = ticker.upper().strip()
+def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str = ""):
+    t = validate_ticker(ticker)
     hit = _analysis_cache.get(t)
     if hit and hit[0] > time.time():
         return hit[1]
+    _rate_limit("analyze:" + _client_ip(request))  # only uncached (costly) analyses count
     m = fetch_stock(t)
     ph = classify_phase(m)
     deep = fetch_deep_data(t)
