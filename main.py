@@ -13,7 +13,7 @@ Env vars (set these on Render):
   PHASELENS_MOCK       optional — "1" = sample market data (testing without network)
 """
 import os, json, time, sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 
 import httpx
@@ -1171,12 +1171,17 @@ def check_admin(key: str | None, authorization: str | None):
         if u["email"] == ADMIN_EMAIL:
             return
         raise HTTPException(403, f"{u['email']} is not the admin account")
+    # Deny by default — no valid admin key and no signed-in admin token.
+    raise HTTPException(401, "Admin authentication required")
     raise HTTPException(401, "Admin auth required: ?key= or Bearer token")
 
 @app.get("/api/admin/summary")
 def admin_summary(key: str | None = Query(None),
-                  authorization: str | None = Header(None)):
+                  authorization: str | None = Header(None),
+                  days: int = Query(30)):
     check_admin(key, authorization)
+    win = max(1, min(days, 366))
+    window = (datetime.now(timezone.utc) - timedelta(days=win)).isoformat()
     with db() as conn:
         c = conn.cursor()
         c.execute("SELECT COUNT(DISTINCT visitor_id) FROM events"); visitors = c.fetchone()[0]
@@ -1184,31 +1189,52 @@ def admin_summary(key: str | None = Query(None),
         c.execute("SELECT COUNT(*) FROM events"); total_events = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM analyses"); analyses = c.fetchone()[0]
         c.execute("SELECT COUNT(DISTINCT visitor_id) FROM analyses WHERE visitor_id<>''"); unique_analyzers = c.fetchone()[0]
+        # Window-scoped counts
+        c.execute(q("SELECT COUNT(*) FROM events WHERE event LIKE 'signin%' AND created_at>=?"), (window,))
+        signins_window = c.fetchone()[0]
+        c.execute(q("SELECT COUNT(DISTINCT email) FROM events WHERE email<>'' AND created_at>=?"), (window,))
+        active_accounts = c.fetchone()[0]
+
         c.execute("""SELECT ticker, COUNT(*) n FROM events
                      WHERE ticker<>'' GROUP BY ticker ORDER BY n DESC LIMIT 8""")
         top_tickers = [{"ticker": r[0], "count": r[1]} for r in c.fetchall()]
         c.execute("""SELECT substr(created_at,1,10) d, COUNT(*) n FROM events
-                     GROUP BY d ORDER BY d DESC LIMIT 14""")
+                     GROUP BY d ORDER BY d DESC LIMIT 30""")
         daily = [{"date": r[0], "count": r[1]} for r in c.fetchall()][::-1]
-        c.execute("""SELECT email,name,provider,sign_ins,first_seen,last_seen
-                     FROM accounts ORDER BY last_seen DESC LIMIT 50""")
+
+        # Accounts — enriched with terms-acceptance + per-account analysis count
+        c.execute("""SELECT a.email,a.name,a.provider,a.sign_ins,a.first_seen,a.last_seen,
+                            (SELECT MAX(t.agreed_at) FROM terms t WHERE LOWER(t.email)=LOWER(a.email)),
+                            (SELECT COUNT(*) FROM analyses an WHERE LOWER(an.email)=LOWER(a.email))
+                     FROM accounts a ORDER BY a.last_seen DESC LIMIT 200""")
         accounts = [{"email": r[0], "name": r[1] or "", "provider": r[2] or "",
-                     "sign_ins": r[3], "first_seen": r[4], "last_seen": r[5]}
+                     "sign_ins": r[3], "first_seen": r[4], "last_seen": r[5],
+                     "terms_agreed_at": r[6], "analyses": r[7]}
                     for r in c.fetchall()]
-        c.execute("""SELECT visitor_id,email,event,ticker,created_at FROM events
-                     ORDER BY id DESC LIMIT 50""")
+
+        # Login history within the window (every sign-in, newest first)
+        c.execute(q("""SELECT email, visitor_id, created_at FROM events
+                       WHERE event LIKE 'signin%' AND created_at>=?
+                       ORDER BY id DESC LIMIT 300"""), (window,))
+        signin_history = [{"email": r[0] or "(unknown)", "visitor_id": r[1] or "", "at": r[2]}
+                          for r in c.fetchall()]
+
+        # Full activity log within the window
+        c.execute(q("""SELECT visitor_id,email,event,ticker,created_at FROM events
+                       WHERE created_at>=? ORDER BY id DESC LIMIT 500"""), (window,))
         events = [{"visitor_id": r[0], "email": r[1] or "", "event": r[2],
                    "ticker": r[3] or "", "at": r[4]} for r in c.fetchall()]
+
         # Verdict breakdown
         c.execute("""SELECT verdict, COUNT(*) n FROM analyses
                      WHERE verdict<>'' GROUP BY verdict ORDER BY n DESC""")
         verdict_breakdown = [{"verdict": r[0], "count": r[1]} for r in c.fetchall()]
 
-        # Recent analyses with full verdict data
-        c.execute("""SELECT visitor_id, email, ticker, verdict, recommendation,
+        # Recent analyses with full verdict data, within the window
+        c.execute(q("""SELECT visitor_id, email, ticker, verdict, recommendation,
                             score, phase, buffett_score, dilution_status,
                             runway_status, stage, created_at
-                     FROM analyses ORDER BY id DESC LIMIT 100""")
+                     FROM analyses WHERE created_at>=? ORDER BY id DESC LIMIT 300"""), (window,))
         recent_analyses = [{
             "visitor_id": r[0], "email": r[1] or "(anonymous)",
             "ticker": r[2], "verdict": r[3], "recommendation": r[4],
@@ -1229,9 +1255,11 @@ def admin_summary(key: str | None = Query(None),
 
     return {"visitors": visitors, "accounts": n_accounts,
             "total_events": total_events, "analyses": analyses, "unique_analyzers": unique_analyzers,
+            "window_days": win, "signins_window": signins_window, "active_accounts": active_accounts,
+            "db_persistent": IS_PG, "storage": "PostgreSQL (persistent)" if IS_PG else "SQLite (EPHEMERAL — wiped on restart/redeploy)",
             "top_tickers": top_tickers, "daily": daily,
             "verdict_breakdown": verdict_breakdown,
             "recent_analyses": recent_analyses,
             "ticker_verdicts": ticker_verdicts,
-            "account_list": accounts, "recent_events": events,
+            "account_list": accounts, "signin_history": signin_history, "recent_events": events,
             "admin_email": ADMIN_EMAIL}
