@@ -78,49 +78,53 @@ def q(sql):
     return sql.replace("%", "%%").replace("?", "%s")
 
 def init_db():
-    with db() as conn:
-        c = conn.cursor()
-        if IS_PG:
-            c.execute("""CREATE TABLE IF NOT EXISTS events(
-                id SERIAL PRIMARY KEY, visitor_id TEXT, email TEXT,
-                event TEXT, ticker TEXT, created_at TEXT)""")
-        else:
-            c.execute("""CREATE TABLE IF NOT EXISTS events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, visitor_id TEXT, email TEXT,
-                event TEXT, ticker TEXT, created_at TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS accounts(
-            uid TEXT PRIMARY KEY, email TEXT, name TEXT, provider TEXT,
-            first_seen TEXT, last_seen TEXT, sign_ins INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS terms(
-            visitor_id TEXT PRIMARY KEY, email TEXT,
-            agreed_at TEXT, ip_hash TEXT)""")
-        # Account-scoped terms lookup (one-and-done per email, across devices)
+    conn = _connect()
+    c = conn.cursor()
+    def ddl(sql, optional=False):
+        # Each DDL runs in its own transaction. On Postgres a failed statement
+        # aborts the transaction, so we commit on success and rollback on failure
+        # — otherwise an already-applied migration would poison later statements
+        # and crash the app on its second boot. `optional=True` swallows errors
+        # for idempotent migrations (column/index already exists).
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_terms_email ON terms(email)")
+            c.execute(sql)
+            conn.commit()
         except Exception:
-            pass
-        # Terms versioning — lets a Terms change force re-consent. NULL = legacy v1.
-        try:
-            c.execute("ALTER TABLE terms ADD COLUMN terms_version INTEGER")
-        except Exception:
-            pass
-        # analyses table — stores every verdict result for admin dashboard
-        c.execute("""CREATE TABLE IF NOT EXISTS analyses(
-            id INTEGER PRIMARY KEY """ + ("GENERATED ALWAYS AS IDENTITY" if IS_PG else "AUTOINCREMENT") + """,
-            visitor_id TEXT, email TEXT, ticker TEXT,
-            verdict TEXT, recommendation TEXT, score INTEGER,
-            phase TEXT, buffett_score INTEGER, dilution_status TEXT,
-            runway_status TEXT, stage TEXT, created_at TEXT)""" if not IS_PG else
-            """CREATE TABLE IF NOT EXISTS analyses(
+            conn.rollback()
+            if not optional:
+                raise
+    if IS_PG:
+        ddl("""CREATE TABLE IF NOT EXISTS events(
+            id SERIAL PRIMARY KEY, visitor_id TEXT, email TEXT,
+            event TEXT, ticker TEXT, created_at TEXT)""")
+    else:
+        ddl("""CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, visitor_id TEXT, email TEXT,
+            event TEXT, ticker TEXT, created_at TEXT)""")
+    ddl("""CREATE TABLE IF NOT EXISTS accounts(
+        uid TEXT PRIMARY KEY, email TEXT, name TEXT, provider TEXT,
+        first_seen TEXT, last_seen TEXT, sign_ins INTEGER DEFAULT 0)""")
+    ddl("""CREATE TABLE IF NOT EXISTS terms(
+        visitor_id TEXT PRIMARY KEY, email TEXT,
+        agreed_at TEXT, ip_hash TEXT)""")
+    if IS_PG:
+        ddl("""CREATE TABLE IF NOT EXISTS analyses(
             id SERIAL PRIMARY KEY, visitor_id TEXT, email TEXT, ticker TEXT,
             verdict TEXT, recommendation TEXT, score INTEGER,
             phase TEXT, buffett_score INTEGER, dilution_status TEXT,
             runway_status TEXT, stage TEXT, created_at TEXT)""")
-        # Migrate: add terms_agreed_at to accounts if missing
-        try:
-            c.execute("ALTER TABLE accounts ADD COLUMN terms_agreed_at TEXT")
-        except Exception:
-            pass
+    else:
+        ddl("""CREATE TABLE IF NOT EXISTS analyses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            visitor_id TEXT, email TEXT, ticker TEXT,
+            verdict TEXT, recommendation TEXT, score INTEGER,
+            phase TEXT, buffett_score INTEGER, dilution_status TEXT,
+            runway_status TEXT, stage TEXT, created_at TEXT)""")
+    # Idempotent migrations — safe to fail if already applied.
+    ddl("CREATE INDEX IF NOT EXISTS idx_terms_email ON terms(email)", optional=True)
+    ddl("ALTER TABLE terms ADD COLUMN terms_version INTEGER", optional=True)
+    ddl("ALTER TABLE accounts ADD COLUMN terms_agreed_at TEXT", optional=True)
+    conn.close()
 init_db()
 
 def now_iso():
