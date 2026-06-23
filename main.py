@@ -1175,6 +1175,14 @@ def fetch_stock(ticker: str) -> dict:
                 "description":      (prof.get("description") or "")[:1800],
                 "industry":         prof.get("industry") or "",
                 "sector":           prof.get("sector") or "",
+                # Management/company facts (from same profile call — no extra request)
+                "ceo":              prof.get("ceo") or "",
+                "employees":        prof.get("fullTimeEmployees") or "",
+                "ipo_date":         prof.get("ipoDate") or "",
+                "website":          prof.get("website") or "",
+                "city":             prof.get("city") or "",
+                "state":            prof.get("state") or "",
+                "country":          prof.get("country") or "",
             }
 
             # ── GAP-FILL: FMP gave a price but fundamentals came back sparse
@@ -2503,6 +2511,40 @@ def root():
 def api_stock(ticker: str):
     return fetch_stock(ticker)
 
+_execs_cache = {}
+_EXECS_TTL = 24 * 3600  # exec roster changes rarely — cache a day
+
+def fetch_executives(ticker: str) -> list:
+    """Fetch key executives (name, title, pay) from FMP. Fail-safe: returns []
+    on any error so it can never break the analyze endpoint."""
+    t = ticker.upper().strip()
+    hit = _execs_cache.get(t)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    out = []
+    if FMP_API_KEY and not MOCK:
+        try:
+            fmp_t = _normalize_fmp_ticker(t)
+            raw = _fmp_get(f"key-executives?symbol={fmp_t}")
+            if raw and isinstance(raw, list):
+                for e in raw[:6]:  # top 6 is plenty for a card
+                    nm = e.get("name") or ""
+                    ti = e.get("title") or ""
+                    if not nm:
+                        continue
+                    pay = e.get("pay")
+                    out.append({
+                        "name": nm,
+                        "title": ti,
+                        "pay": pay if isinstance(pay, (int, float)) and pay > 0 else None,
+                        "year": e.get("yearBorn") or None,
+                    })
+        except Exception:
+            out = []
+    _execs_cache[t] = (time.time() + _EXECS_TTL, out)
+    return out
+
+
 @app.get("/api/analyze/{ticker}")
 def api_analyze(ticker: str, visitor_id: str = "", email: str = ""):
     t = ticker.upper().strip()
@@ -2635,6 +2677,14 @@ def _api_analyze_inner(t: str, visitor_id: str = "", email: str = ""):
         "summary": ai.get("summary"), "phaseRationale": ai.get("phaseRationale"),
         "strengths": ai.get("strengths"), "risks": ai.get("risks"),
         "mgmtNote": ai.get("mgmtNote"),
+        "management": {
+            "ceo":        m.get("ceo") or "",
+            "employees":  m.get("employees") or "",
+            "ipoDate":    m.get("ipo_date") or "",
+            "website":    m.get("website") or "",
+            "hq":         ", ".join([x for x in [m.get("city"), m.get("state"), m.get("country")] if x]),
+            "executives": fetch_executives(t),
+        },
         "disclaimer": DISCLAIMER,
         "complianceShield": COMPLIANCE_SHIELD,
         "generated_at": now_iso(),
