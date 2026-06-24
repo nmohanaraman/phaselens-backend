@@ -1394,16 +1394,29 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     fcf_y    = m.get("fcf_yield")        # %
     eps_hist = m.get("eps_history", [])  # newest→oldest
 
-    # ROIC
-    roic_s = _status(roic, 10, 5)
-    checks["roic"] = {
-        "value": f"{roic:.1f}%" if roic else "N/A",
-        "status": roic_s,
-        "label": "Pass" if roic_s=="green" else ("Warning" if roic_s=="yellow" else "Fail"),
-    }
-    if roic_s=="green":   drivers.append(f"+5: ROIC {roic:.1f}% — strong capital efficiency")
-    elif roic_s=="yellow":drivers.append(f"-2: ROIC {roic:.1f}% — mediocre capital allocation")
-    elif roic_s=="red":   drivers.append(f"-8: ROIC {roic:.1f}% — poor capital efficiency")
+    # ROIC — with a negative-operating-margin sanity guard.
+    _om_for_roic = m.get("operating_margin")
+    _deeply_unprofitable = isinstance(_om_for_roic, (int, float)) and _om_for_roic < 0
+    if _deeply_unprofitable and isinstance(roic, (int, float)) and roic > 0:
+        # Positive ROIC is impossible alongside deep operating losses — NOPAT is
+        # negative. The reported figure is a data artifact (e.g. net cash offsetting
+        # debt in the denominator). Flag as not-meaningful instead of a strength.
+        checks["roic"] = {
+            "value": "N/M",
+            "status": "red",
+            "label": "Not Meaningful (operating loss)",
+        }
+        drivers.append(f"-8: ROIC not meaningful — deep operating losses ({_om_for_roic:.0f}%) make capital efficiency negative")
+    else:
+        roic_s = _status(roic, 10, 5)
+        checks["roic"] = {
+            "value": f"{roic:.1f}%" if roic else "N/A",
+            "status": roic_s,
+            "label": "Pass" if roic_s=="green" else ("Warning" if roic_s=="yellow" else "Fail"),
+        }
+        if roic_s=="green":   drivers.append(f"+5: ROIC {roic:.1f}% — strong capital efficiency")
+        elif roic_s=="yellow":drivers.append(f"-2: ROIC {roic:.1f}% — mediocre capital allocation")
+        elif roic_s=="red":   drivers.append(f"-8: ROIC {roic:.1f}% — poor capital efficiency")
 
     # Gross Margin
     gm_s = _status(gm, 40, 20)
@@ -1839,14 +1852,17 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     # A value trap is, by definition, an OPTICALLY CHEAP stock hiding decline.
     # A high-growth company — profitable or not — cannot be a value trap, because
     # nothing about it looks cheap on traditional screens. Route growth first.
-    is_high_growth = rg is not None and rg > 20
+    # Align the growth gate to the PHASE threshold (15%), not 20%, so a 16-20%
+    # grower in GROWTH phase doesn't fall through to value-trap logic (CFA-flagged
+    # RKLB regression). Also treat GROWTH phase itself as growth.
+    is_high_growth = (rg is not None and rg > 15) or phase == "GROWTH"
 
     if phase == "GROWTH" and pe and pe > 40:
         verdict = "GROWTH_PLAY"
         confidence = "HIGH" if buffett_score >= 3 and dilution_known and dilution_flag == "green" else "MEDIUM"
         summary = (f"Not a value play — priced for growth (P/E {pe:.1f}x). "
                    f"Evaluate on Rule of 40 and revenue quality, not traditional value metrics.")
-    elif is_high_growth and (om is not None and om < 0):
+    elif is_high_growth and (om is None or om < 0):
         # High revenue growth + unprofitable. This is SPECULATIVE GROWTH RISK,
         # NOT a value trap (it isn't cheap — it's expensive and unproven).
         # Severity scales with balance-sheet strength and runway.
@@ -1863,6 +1879,13 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
             summary = (f"Unprofitable growth — revenue +{rg:.0f}%, operating margin {om:.0f}%. "
                        f"Balance sheet can fund the burn for now. Watch path to profitability, "
                        f"not traditional value metrics.")
+    elif phase == "GROWTH":
+        # Any remaining GROWTH-phase asset is speculative/execution risk, never a
+        # value trap (CFA: growth assets must bypass Value/Trap entirely).
+        verdict = "SPECULATIVE_GROWTH"
+        confidence = "MEDIUM"
+        summary = (f"Growth-phase company (revenue +{rg:.0f}%). Evaluate on execution and "
+                   f"path-to-profitability, not value metrics — it is not optically cheap.")
     elif trap_score >= 40 and trap_score > value_score and not is_high_growth:
         verdict = "VALUE_TRAP"
         confidence = "HIGH" if trap_score >= 60 else "MEDIUM"
@@ -2089,6 +2112,12 @@ def _interpret_metrics(m: dict) -> str:
         elif rg < 30: lab = "strong growth"
         else:         lab = "hyper-growth — this is an EARLY/GROWTH stage company, never 'decline'"
         parts.append(f"Revenue growth {rg:.1f}% is {lab}.")
+    roic = m.get("roic")
+    om_chk = m.get("operating_margin")
+    if isinstance(roic, (int, float)) and isinstance(om_chk, (int, float)) and om_chk < 0 and roic > 0:
+        parts.append(f"ROIC reads {roic:.1f}% but operating margin is {om_chk:.0f}% — the positive ROIC "
+                     f"is a DATA ARTIFACT and is NOT meaningful. Do NOT cite ROIC as strong capital "
+                     f"efficiency; a deeply unprofitable company has negative real ROIC.")
     dy = m.get("dividend_yield")
     if isinstance(dy, (int, float)):
         if dy <= 0:
