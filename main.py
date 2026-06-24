@@ -1283,6 +1283,18 @@ def fetch_stock(ticker: str) -> dict:
             data["pe_note"] = "N/A — negative earnings"
     except Exception:
         pass
+    # DIVIDEND GUARD: kill noise-level yields and false dividends. A sub-0.1% yield
+    # is almost always scraper noise (fractional ratio mistaken for a yield), and an
+    # unprofitable growth company paying a "dividend" is a data error (CFA-flagged:
+    # APLD showed 0.0473%). Suppress so no phantom "income stream" strength appears.
+    try:
+        _dy = data.get("dividend_yield")
+        if isinstance(_dy, (int, float)):
+            _unprofitable = isinstance(_om, (int, float)) and _om < 0
+            if _dy < 0.1 or (_unprofitable and _dy < 0.5):
+                data["dividend_yield"] = 0.0
+    except Exception:
+        pass
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
@@ -1586,7 +1598,22 @@ def compute_forensics(m: dict, deep: dict) -> dict:
 
 
 # ─────────────────────────── Phase classification ──────────────────────────
+# Phase overrides for asset classes that don't fit a corporate lifecycle model.
+# Fixed-income ETFs are income/defensive; mega-cap conglomerates are mature.
+_INCOME_DEFENSIVE_TICKERS = {"BND","BNDX","AGG","TLT","IEF","SHY","LQD","HYG",
+                             "BIL","SPAXX","VMFXX","FDRXX","MUB","VCIT","VCSH","JNK"}
+_MATURE_CONGLOMERATES = {"BRK.B","BRK.A","BRKB","BRK-B"}
+
 def classify_phase(m: dict) -> dict:
+    # Asset-class overrides FIRST — these don't follow a corporate growth lifecycle.
+    tk = (m.get("ticker") or "").upper()
+    if tk in _INCOME_DEFENSIVE_TICKERS:
+        return {"phase": "MATURE",
+                "signals": ["Fixed-income / defensive asset — income-oriented, not a growth equity"]}
+    if tk in _MATURE_CONGLOMERATES:
+        return {"phase": "MATURE",
+                "signals": ["Diversified mature conglomerate — cash-generative, not a growth-phase equity"]}
+
     # Distinguish missing from zero. PRE_REVENUE must require ACTUAL negative
     # signals, not absence of data. If revenue growth is unknown, we cannot
     # classify lifecycle phase at all.
@@ -2062,6 +2089,13 @@ def _interpret_metrics(m: dict) -> str:
         elif rg < 30: lab = "strong growth"
         else:         lab = "hyper-growth — this is an EARLY/GROWTH stage company, never 'decline'"
         parts.append(f"Revenue growth {rg:.1f}% is {lab}.")
+    dy = m.get("dividend_yield")
+    if isinstance(dy, (int, float)):
+        if dy <= 0:
+            parts.append("Dividend yield is 0% — this company pays NO dividend. Do NOT mention "
+                         "dividends, income, or yield as a strength; there is no income stream.")
+        elif dy < 1:
+            parts.append(f"Dividend yield {dy:.2f}% is negligible — do not frame as a meaningful income stream.")
     if not parts:
         return ""
     return " METRIC INTERPRETATION (use these exact characterizations, do not contradict them): " + " ".join(parts)
@@ -2397,6 +2431,11 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
             "confidence": value_verdict.get("confidence", "MEDIUM"),
             "trap_score": value_verdict.get("trap_score", 0),
             "value_score": value_verdict.get("value_score", 0),
+            # Dynamic score labels (CFA-flagged): "Value/Trap" framing only makes
+            # sense for mature/decline names users screen as cheap. For speculative
+            # growth, relabel to Execution / Runway risk.
+            "score_label_left":  "Execution" if classification == "SPECULATIVE GROWTH" else "Value",
+            "score_label_right": "Runway Risk" if classification == "SPECULATIVE GROWTH" else "Trap",
         },
         "section2": {
             "title": "THE REASONING",
