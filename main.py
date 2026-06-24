@@ -1271,6 +1271,18 @@ def fetch_stock(ticker: str) -> dict:
             }
         except Exception as exc:
             raise HTTPException(503, f"Market data unavailable for {t}: {_sanitize_error(exc)}. Set FMP_API_KEY on Render for reliable data.")
+    # ── DATA-INTEGRITY GUARD: a company with negative operating margin cannot
+    #    have a meaningful positive trailing P/E. Trailing P/E on negative GAAP
+    #    earnings is mathematically meaningless — null it so the UI shows N/A
+    #    rather than a misleading positive multiple (CFA-flagged bug).
+    try:
+        _om = data.get("operating_margin")
+        _pe = data.get("pe_ratio")
+        if isinstance(_om, (int, float)) and _om < 0 and isinstance(_pe, (int, float)) and _pe > 0:
+            data["pe_ratio"] = None
+            data["pe_note"] = "N/A — negative earnings"
+    except Exception:
+        pass
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
@@ -1899,7 +1911,17 @@ def compute_signal(m: dict, phase: str) -> dict:
     def add(pts, why):
         nonlocal score
         score += pts
-        drivers.append(("+" if pts >= 0 else "") + f"{pts}: {why}")
+        line = ("+" if pts >= 0 else "") + f"{pts}: {why}"
+        # Dedup guard: skip if a driver with the SAME leading phrase already exists
+        # (prevents the duplicate "Strong revenue growth" the CFA flagged) while
+        # still allowing distinct drivers that merely share a word.
+        _reason = why.split("(")[0].strip().lower()
+        if _reason:
+            for _d in drivers:
+                _existing = _d.split(":", 1)[-1].split("(")[0].strip().lower()
+                if _existing == _reason:
+                    return
+        drivers.append(line)
 
     if rg > 20: add(8, f"Strong revenue growth ({rg:.1f}%)")
     elif rg > 10: add(4, f"Healthy revenue growth ({rg:.1f}%)")
@@ -1926,11 +1948,10 @@ def compute_signal(m: dict, phase: str) -> dict:
         # hardware/aerospace/energy/datacenter businesses is an architectural error
         # (they carry heavy CapEx cycles that no software scale can fairly grade).
         if _is_capital_intensive(m):
-            # Use a capital-intensity-appropriate growth signal instead.
-            if rg is not None and rg > 30:
-                add(4, f"Strong revenue growth ({rg:.0f}%) — capital-intensive scaling")
-            elif rg is not None and rg > 15:
-                add(2, f"Solid revenue growth ({rg:.0f}%)")
+            # Capital-intensive (aerospace/datacenter/energy): Rule of 40 doesn't apply.
+            # Revenue growth is already credited above (do NOT restate it — that caused
+            # a duplicate driver). Add a single capital-context note instead.
+            add(0, "Capital-intensive business — graded on growth + CapEx, not Rule of 40")
         else:
             r40 = rg + om
             if r40 >= 40: add(6, f"Rule of 40 passed ({r40:.0f})")
@@ -2039,6 +2060,23 @@ def _interpret_metrics(m: dict) -> str:
     return " METRIC INTERPRETATION (use these exact characterizations, do not contradict them): " + " ".join(parts)
 
 
+def _physical_business_guard(m: dict) -> str:
+    """Block 'pure software/SaaS' boilerplate for capital-intensive physical
+    businesses (CFA-flagged: APLD, a data-center builder, was described as
+    possibly 'pure software'). Tech SECTOR does not imply software business model."""
+    if _is_capital_intensive(m):
+        ind = (m.get("industry") or "").strip()
+        ind_txt = f" (industry: {ind})" if ind else ""
+        return (
+            f"CRITICAL: This is a CAPITAL-INTENSIVE, PHYSICAL-INFRASTRUCTURE business{ind_txt}. "
+            f"It is NOT a pure software or SaaS company, regardless of its 'Technology' sector tag. "
+            f"It owns and operates heavy physical assets (e.g. data centers, hardware, plants, fleets). "
+            f"Do NOT describe it as 'pure software', 'asset-light', or 'SaaS'. For the physical "
+            f"integration moat lens, treat physical infrastructure as a REAL, hard-to-replicate asset."
+        )
+    return ""
+
+
 def groq_analysis(t, m, phase, sig, forensics=None):
     forensics_ctx = ""
     if forensics and forensics.get("checks"):
@@ -2066,6 +2104,7 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         f"the business stage as 'unknown' or 'unclear' in any strength or risk. "
         f"If {phase} is GROWTH, frame stage-related risks around burn rate and path-to-profitability "
         f"(e.g. 'high capital spend and path-to-profitability timeline'), never 'unknown business stage'. "
+        f"{_physical_business_guard(m)} "
         f"Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
         f"{get_business_model_context(t, m)}"
@@ -2119,7 +2158,45 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         timeout=30,
     )
     r.raise_for_status()
-    return json.loads(r.json()["choices"][0]["message"]["content"])
+    parsed = json.loads(r.json()["choices"][0]["message"]["content"])
+    return _sanitize_ai_scores(parsed, sig)
+
+
+def _sanitize_ai_scores(parsed: dict, sig: dict) -> dict:
+    """Remove any score the LLM invented in its prose. The computed score is the
+    single source of truth (CFA-flagged: summary said 38/100 while dial showed 30).
+    Strips 'score of NN/100', 'NN/100', 'score NN' patterns from text fields so the
+    model can never contradict the real dial value."""
+    import re
+    real = sig.get("score")
+    # Patterns that capture an LLM-asserted score out of 100 or a bare 'score NN'
+    pat_100 = re.compile(r"\b(?:signal\s+)?score\s+(?:of\s+)?\d{1,3}\s*/\s*100", re.I)
+    pat_slash = re.compile(r"\b\d{1,3}\s*/\s*100\b")
+    pat_score_n = re.compile(r"\bscore\s+(?:of\s+)?\d{1,3}\b", re.I)
+
+    def clean(text):
+        if not isinstance(text, str):
+            return text
+        # Replace an explicit "score of NN/100" with the REAL score when we have it,
+        # otherwise drop the fabricated fragment entirely.
+        if real is not None:
+            text = pat_100.sub(f"score of {real}/100", text)
+            text = pat_slash.sub(f"{real}/100", text)
+            text = pat_score_n.sub(f"score of {real}", text)
+        else:
+            text = pat_100.sub("", text)
+            text = pat_slash.sub("", text)
+            text = pat_score_n.sub("", text)
+        return re.sub(r"\s{2,}", " ", text).strip()
+
+    for key in ("summary", "phaseRationale", "mgmtNote"):
+        if key in parsed:
+            parsed[key] = clean(parsed[key])
+    for key in ("strengths", "risks"):
+        if isinstance(parsed.get(key), list):
+            parsed[key] = [clean(x) for x in parsed[key]]
+    return parsed
+
 
 def fallback_analysis(t, m, phase, sig, forensics=None):
     rg, om = m.get("revenue_growth") or 0, m.get("operating_margin") or 0
