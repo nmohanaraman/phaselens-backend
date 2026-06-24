@@ -1448,8 +1448,8 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     buffett_pass = sum(1 for c in ["roic","gross_margin","debt_to_equity","fcf_yield","eps_predictability"]
                       if checks[c]["status"]=="green")
     checks["buffett_score"] = {"pass": buffett_pass, "total": 5}
-    if buffett_pass >= 4: drivers.append(f"+5: Strong Buffett Balance Sheet — {buffett_pass}/5 checks passed")
-    elif buffett_pass <= 2: drivers.append(f"-5: Weak Buffett Balance Sheet — only {buffett_pass}/5 checks passed")
+    if buffett_pass >= 4: drivers.append(f"+5: Strong Buffett Quality Score — {buffett_pass}/5 checks passed")
+    elif buffett_pass <= 2: drivers.append(f"-5: Weak Buffett Quality Score — only {buffett_pass}/5 quality checks passed")
 
     # ── 2. DILUTION (spec format) ─────────────────────────────────────
     # Priority: weighted-average shares (income statement) — most reliable.
@@ -1739,11 +1739,14 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
 
     if buffett_score <= 1:
         trap_score += 20
-        warnings.append(f"🚨 Buffett Balance Sheet {buffett_score}/5 — structurally broken balance sheet cannot support recovery")
+        # Quality-score failure. Frame as profitability/quality gap, not a liquidity
+        # crisis — a cash-rich but unprofitable growth company fails these QUALITY
+        # checks (ROIC/margin/FCF/EPS) without being insolvent.
+        warnings.append(f"🚨 Buffett Quality Score {buffett_score}/5 — weak profitability & capital-efficiency metrics")
 
     if buffett_score == 2:
         trap_score += 10
-        warnings.append(f"⚠️ Weak balance sheet {buffett_score}/5 — limited financial buffer for downturn")
+        warnings.append(f"⚠️ Buffett Quality Score {buffett_score}/5 — limited profitability buffer")
 
     if not retained_grow:
         trap_score += 15
@@ -1768,7 +1771,7 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     # ── VALUE STOCK indicators (each adds to value_score) ──────────────
     if buffett_score >= 4:
         value_score += 25
-        reasons.append(f"✅ Fortress balance sheet {buffett_score}/5 Buffett checks — financial durability intact")
+        reasons.append(f"✅ Fortress quality {buffett_score}/5 Buffett checks — strong profitability & capital efficiency")
 
     # Forensics dilution status vocabulary is green (buyback/accretive) / gray
     # (neutral or insufficient) / red (issuing/toxic). Only a genuine buyback
@@ -2036,11 +2039,15 @@ def _interpret_metrics(m: dict) -> str:
     parts = []
     de = m.get("debt_to_equity")
     if isinstance(de, (int, float)):
-        if de <= 0.5:   lab = "VERY LOW / pristine — do NOT describe as high debt"
-        elif de <= 1.0: lab = "conservative"
-        elif de <= 2.0: lab = "moderate"
-        else:           lab = "elevated/high"
-        parts.append(f"Debt/Equity {de:.2f}x is {lab}.")
+        # Assign ONE classification and ONE placement (strength vs risk) so the
+        # narrative can't call the same ratio both "manageable strength" and
+        # "concerning risk" (CFA-flagged contradiction).
+        if de <= 0.5:   lab, place = "VERY LOW / pristine — do NOT describe as high debt", "STRENGTH"
+        elif de <= 1.0: lab, place = "conservative", "STRENGTH"
+        elif de <= 1.5: lab, place = "moderate (acceptable)", "NEUTRAL — mention at most once"
+        elif de <= 2.5: lab, place = "elevated (industry-standard for capital-intensive buildouts, but a watch item)", "RISK"
+        else:           lab, place = "high", "RISK"
+        parts.append(f"Debt/Equity {de:.2f}x is {lab}. Place it ONLY in {place} — never in both strengths and risks.")
     om = m.get("operating_margin")
     if isinstance(om, (int, float)):
         if om < 0:    lab = "negative (unprofitable) — but this alone does NOT mean 'decline phase'"
@@ -2105,6 +2112,9 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         f"If {phase} is GROWTH, frame stage-related risks around burn rate and path-to-profitability "
         f"(e.g. 'high capital spend and path-to-profitability timeline'), never 'unknown business stage'. "
         f"{_physical_business_guard(m)} "
+        f"CONSISTENCY RULE: Each individual metric (especially Debt/Equity) may appear in "
+        f"EITHER strengths OR risks, NEVER both. Do not describe the same ratio as both a "
+        f"strength and a concern. Use the placement guidance given in the metric interpretation above. "
         f"Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
         f"{get_business_model_context(t, m)}"
@@ -2291,9 +2301,8 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
 
     if classification == "SPECULATIVE GROWTH":
         # Speculative growth is not "exit" (it's not broken) nor "buy" (it's
-        # unproven). One coherent action: watchlist-only for non-owners, which
-        # also reads sensibly for owners as "don't add — cap your position."
-        market_action = "WATCHLIST ONLY — SPECULATIVE"
+        # unproven). CFP-refined: clarify it's a speculative sleeve, no new capital.
+        market_action = "SPECULATIVE HOLD / AVOID NEW CAPITAL"
     elif classification == "VALUE TRAP":
         market_action = "AVOID OR EXIT PROFILE"
     elif rec == "BUY" and score >= 80:
@@ -2358,11 +2367,13 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
         )
     elif classification == "SPECULATIVE GROWTH":
         action_text = (
-            "This is a high-growth, pre-profitability business — speculative, not a value "
-            "trap. It is unproven rather than broken. Market participants who do NOT own it "
-            "typically keep it on a WATCHLIST and avoid initiating until profitability "
-            "improves; those who already own it typically HOLD with a capped position size "
-            "to limit risk. Evaluate on path-to-profitability and cash runway, not value metrics."
+            "Treat any position here as a SPECULATIVE SLEEVE, not a core holding. "
+            "SPECULATIVE HOLD / AVOID NEW CAPITAL: those who do NOT own it should avoid "
+            "deploying new capital until profitability improves (watchlist only); those who "
+            "already own it may HOLD a deliberately capped, small position sized for total-loss "
+            "tolerance. This is unproven rather than broken — judge it on path-to-profitability "
+            "and cash runway, not traditional value metrics. The low score reflects investment "
+            "RISK, not a directive to panic-sell a speculative sleeve you sized correctly."
         )
     elif classification == "VALUE TRAP":
         action_text = (
