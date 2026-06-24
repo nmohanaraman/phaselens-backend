@@ -1540,15 +1540,27 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     om = om_raw if isinstance(om_raw, (int, float)) else None
     if rg is None:
         stage_node, stage_status = "Unknown — Insufficient Data", "gray"
-    elif rg > 30 and fcf_abs <= 0 and fcf_known:
-        stage_node, stage_status = "Early Stage / Venture",   "blue"
+    # Lifecycle stage is driven by REVENUE TRAJECTORY, not current profitability.
+    # A high-growth company burning cash is Early Stage / Growth — NOT Decline.
+    # Decline requires actual revenue contraction (negative growth).
+    elif rg > 30:
+        # High growth. If also unprofitable, it's an early-stage cash burner —
+        # still NOT decline. Profitability is assessed separately (Buffett/margins).
+        if om is not None and om < 0:
+            stage_node, stage_status = "Early Stage / High Growth", "blue"
+        else:
+            stage_node, stage_status = "Hyper Growth",            "green"
     elif 15 <= rg <= 30:
         stage_node, stage_status = "Growth Phase",            "green"
     elif 0 <= rg < 15 and om is not None and om > 5:
         stage_node, stage_status = "Mature / Cash Cow",       "green"
-    elif rg < 0 or (om is not None and om < 0):
+    elif rg < 0:
+        # Genuine revenue contraction — THIS is decline.
         stage_node, stage_status = "Decline / Distressed",    "red"
-        drivers.append("-10: Decline-phase lifecycle risk")
+        drivers.append("-10: Revenue contracting — decline-phase risk")
+    elif 0 <= rg < 15 and om is not None and om < 0:
+        # Low growth AND unprofitable — stalling, not yet contracting.
+        stage_node, stage_status = "Stalling / Unprofitable", "yellow"
     else:
         stage_node, stage_status = "Unknown — Insufficient Data", "gray"
     checks["stage"] = {
@@ -1976,6 +1988,36 @@ def apply_moat_penalty(sig: dict, moat_assessment: dict) -> dict:
 
 
 # ─────────────────────────── AI analysis (Groq, optional) ──────────────────
+def _interpret_metrics(m: dict) -> str:
+    """Pre-label metrics so the LLM cannot misread them (e.g. D/E 0.02x as 'high
+    debt'). Returns an explicit guidance string appended to the prompt."""
+    parts = []
+    de = m.get("debt_to_equity")
+    if isinstance(de, (int, float)):
+        if de <= 0.5:   lab = "VERY LOW / pristine — do NOT describe as high debt"
+        elif de <= 1.0: lab = "conservative"
+        elif de <= 2.0: lab = "moderate"
+        else:           lab = "elevated/high"
+        parts.append(f"Debt/Equity {de:.2f}x is {lab}.")
+    om = m.get("operating_margin")
+    if isinstance(om, (int, float)):
+        if om < 0:    lab = "negative (unprofitable) — but this alone does NOT mean 'decline phase'"
+        elif om < 10: lab = "thin"
+        elif om < 20: lab = "healthy"
+        else:         lab = "strong"
+        parts.append(f"Operating margin {om:.1f}% is {lab}.")
+    rg = m.get("revenue_growth")
+    if isinstance(rg, (int, float)):
+        if rg < 0:    lab = "CONTRACTING — genuine decline signal"
+        elif rg < 15: lab = "modest"
+        elif rg < 30: lab = "strong growth"
+        else:         lab = "hyper-growth — this is an EARLY/GROWTH stage company, never 'decline'"
+        parts.append(f"Revenue growth {rg:.1f}% is {lab}.")
+    if not parts:
+        return ""
+    return " METRIC INTERPRETATION (use these exact characterizations, do not contradict them): " + " ".join(parts)
+
+
 def groq_analysis(t, m, phase, sig, forensics=None):
     forensics_ctx = ""
     if forensics and forensics.get("checks"):
@@ -1997,6 +2039,7 @@ def groq_analysis(t, m, phase, sig, forensics=None):
     prompt = (
         f"You are a forensic equity research analyst. Company: {t}. "
         f"Financial metrics: {json.dumps(m)}. "
+        f"{_interpret_metrics(m)} "
         f"Lifecycle phase: {phase}. Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
         f"{get_business_model_context(t, m)}"
@@ -2143,7 +2186,12 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
     if classification == "VALUE TRAP" and rec == "BUY" and score >= 75:
         classification = "NEUTRAL"
 
-    if classification == "VALUE TRAP":
+    if classification == "SPECULATIVE GROWTH":
+        # Speculative growth is not "exit" (it's not broken) nor "buy" (it's
+        # unproven). One coherent action: watchlist-only for non-owners, which
+        # also reads sensibly for owners as "don't add — cap your position."
+        market_action = "WATCHLIST ONLY — SPECULATIVE"
+    elif classification == "VALUE TRAP":
         market_action = "AVOID OR EXIT PROFILE"
     elif rec == "BUY" and score >= 80:
         market_action = "STRONG BUY PROFILE"
@@ -2204,6 +2252,14 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
             "where fundamentals outpace market sentiment. Investors looking for long-term "
             "equity growth typically view this as a potential BUY/ACCUMULATE candidate, "
             "provided it aligns with their risk tolerance."
+        )
+    elif classification == "SPECULATIVE GROWTH":
+        action_text = (
+            "This is a high-growth, pre-profitability business — speculative, not a value "
+            "trap. It is unproven rather than broken. Market participants who do NOT own it "
+            "typically keep it on a WATCHLIST and avoid initiating until profitability "
+            "improves; those who already own it typically HOLD with a capped position size "
+            "to limit risk. Evaluate on path-to-profitability and cash runway, not value metrics."
         )
     elif classification == "VALUE TRAP":
         action_text = (
