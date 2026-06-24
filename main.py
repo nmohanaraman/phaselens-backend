@@ -1620,14 +1620,35 @@ _CAPITAL_INTENSIVE_SECTORS = (
     "energy", "utilities", "materials", "industrials", "real estate",
 )
 
+# Known capital-intensive tickers — fallback when FMP profile (sector/industry)
+# is unavailable because a price-only fallback source (Finnhub/Yahoo) was used.
+_CAPITAL_INTENSIVE_TICKERS = {
+    "RKLB", "APLD", "ASTS", "LUNR", "RDW", "ACHR", "JOBY", "SPCE", "BKSY",
+    "PL", "SPIR", "VSAT", "IRDM", "GSAT", "ASTR",          # aerospace/space
+    "TSLA", "RIVN", "LCID", "NIO", "F", "GM",              # automotive
+    "INTC", "MU", "WOLF", "ON", "GFS",                     # semis/hardware
+    "IONQ", "RGTI", "QBTS",                                # quantum hardware
+    "NEE", "DUK", "SO", "XOM", "CVX", "OXY",               # energy/utilities
+    "NUE", "CLF", "X", "FCX", "AA",                        # metals/materials
+    "BA", "LMT", "RTX", "GD", "NOC",                       # aerospace/defense
+}
+
 def _is_capital_intensive(m: dict) -> bool:
     """True if the company's sector/industry implies heavy CapEx, so SaaS-style
-    Rule of 40 grading should be suppressed."""
+    Rule of 40 grading should be suppressed. Falls back to a known-ticker map
+    when profile data (sector/industry) is missing (e.g. Finnhub price fallback)."""
     ind = (m.get("industry") or "").lower()
     sec = (m.get("sector") or "").lower()
+    tk  = (m.get("ticker") or "").upper()
     if any(k in ind for k in _CAPITAL_INTENSIVE_INDUSTRIES):
         return True
     if any(k in sec for k in _CAPITAL_INTENSIVE_SECTORS):
+        return True
+    # Fallback: no sector/industry data → check known-ticker list
+    if not ind and not sec and tk in _CAPITAL_INTENSIVE_TICKERS:
+        return True
+    # Even with data, an explicit ticker match is authoritative
+    if tk in _CAPITAL_INTENSIVE_TICKERS:
         return True
     return False
 
@@ -2040,7 +2061,12 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         f"You are a forensic equity research analyst. Company: {t}. "
         f"Financial metrics: {json.dumps(m)}. "
         f"{_interpret_metrics(m)} "
-        f"Lifecycle phase: {phase}. Signal: {sig['recommendation']} (score {sig['score']}/100). "
+        f"Lifecycle phase: {phase}. "
+        f"IMPORTANT: The lifecycle phase is {phase} — a KNOWN classification. Do NOT describe "
+        f"the business stage as 'unknown' or 'unclear' in any strength or risk. "
+        f"If {phase} is GROWTH, frame stage-related risks around burn rate and path-to-profitability "
+        f"(e.g. 'high capital spend and path-to-profitability timeline'), never 'unknown business stage'. "
+        f"Signal: {sig['recommendation']} (score {sig['score']}/100). "
         f"{forensics_ctx}"
         f"{get_business_model_context(t, m)}"
         f" STEP 1 — IF no ground truth provided above, identify {t}'s ACTUAL BUSINESS MODEL: "
