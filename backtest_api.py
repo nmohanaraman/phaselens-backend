@@ -30,6 +30,7 @@ WHY NOT ROUTE THROUGH /api/analyze
 from __future__ import annotations
 
 import os
+import math
 from fastapi import APIRouter, HTTPException, Request
 
 import backtest_engine as engine
@@ -271,4 +272,25 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
             f"valid track record. Switch BACKTEST_PERIOD=quarter, BACKTEST_LIMIT=40 on "
             f"FMP Starter for a defensible backtest."
         )
-    return result
+    # The signal may never fire (e.g. BUY-only on a name the model only ever rated
+    # HOLD). That makes vol/Sharpe/win-rate mathematically undefined -> NaN. NaN is
+    # NOT valid JSON and breaks JSON.parse in the browser, so scrub non-finite
+    # floats to null. The frontend already renders null metrics as an en-dash.
+    if result["strategy"].get("exposure") in (0, 0.0):
+        result["note"] = (
+            f"The PhaseLens signal was never {in_on} over the available history, so the "
+            f"strategy stayed in cash (flat line). Try the 'BUY or HOLD' mode, or upgrade "
+            f"to quarterly data for more decision points."
+        )
+    return _clean(result)
+
+
+def _clean(obj):
+    """Recursively replace NaN/Inf with None so the payload is valid JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean(v) for v in obj]
+    return obj
