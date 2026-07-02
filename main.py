@@ -12,7 +12,7 @@ Env vars (set these on Render):
   ALLOWED_ORIGINS      optional — comma-separated extra CORS origins
   PHASELENS_MOCK       optional — "1" = sample market data (testing without network)
 """
-import os, json, time, sqlite3, re
+import os, json, time, sqlite3, re, logging
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 
@@ -37,12 +37,20 @@ MOCK                = os.environ.get("PHASELENS_MOCK", "") == "1"
 # are treated as version 1 (the only version that existed before stamping).
 TERMS_VERSION       = int(os.environ.get("TERMS_VERSION", "1"))
 
-app = FastAPI(title="PhaseLens API", version="2.0")
+app = FastAPI(title="PhaseLens API", version="2.1")
+
+def _scrub_secrets(s: str) -> str:
+    """Strip API keys / query strings from any string destined for logs or users."""
+    s = re.sub(r"apikey=[A-Za-z0-9]+", "apikey=***", s)
+    s = re.sub(r"https?://\S+", "[url]", s)
+    return s
 
 _origins = [
     "https://phaselens.ai", "https://www.phaselens.ai",
     "https://phaselens.netlify.app",
-    "http://localhost:3000", "http://localhost:8888", "null",
+    "http://localhost:3000", "http://localhost:8888",
+    # "null" origin removed (CWE-942): it let hostile local files / sandboxed
+    # iframes call the API. Local file:// testing: use `python -m http.server`.
 ]
 _origins += [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
@@ -51,6 +59,14 @@ app.add_middleware(
     allow_origin_regex=r"https://([a-z0-9-]+--)?phaselens\.netlify\.app",
     allow_methods=["*"], allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    return resp
 
 # ─────────────────────────── Database ───────────────────────────────────────
 IS_PG = DATABASE_URL.startswith("postgres")
@@ -318,7 +334,11 @@ def fetch_stock(ticker: str) -> dict:
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(503, f"Market data unavailable for {t}: {exc}")
+            # SECURITY: never interpolate raw exceptions — httpx errors embed the
+            # full request URL including ?apikey=... (CWE-209). Scrub + genericize.
+            logging.getLogger("uvicorn.error").warning(
+                "fetch_stock(%s) failed: %s", t, _scrub_secrets(str(exc)))
+            raise HTTPException(503, f"Market data temporarily unavailable for {t}. Please try again shortly.")
     else:
         # ── yfinance fallback (works locally, unreliable on cloud) ──
         try:
@@ -617,16 +637,38 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
     rg  = m.get("revenue_growth") or 0
     om  = m.get("operating_margin") or 0
 
-    buffett_score = fc.get("buffett", {}).get("total_pass", 0)
-    dilution_flag = fc.get("dilution", {}).get("flag", "CLEAN")
-    dilution_pct  = fc.get("dilution", {}).get("dilution_pct") or 0
-    stage         = fc.get("stage", {}).get("stage", 2)
-    runway_years  = fc.get("cash_runway", {}).get("years")
-    cash          = fc.get("cash_runway", {}).get("cash") or 0
-    debt          = fc.get("buffett", {}).get("cash_gt_debt", {}).get("debt") or 0
-    retained_grow = fc.get("buffett", {}).get("retained_earnings_growing", {}).get("pass", False)
-    has_treasury  = fc.get("buffett", {}).get("treasury_stock", {}).get("pass", False)
-    preferred     = fc.get("buffett", {}).get("zero_preferred", {}).get("amount", 0)
+    # ── Read what compute_forensics ACTUALLY emits (keys verified against
+    # compute_forensics). The old code read fc["buffett"][...], fc["cash_runway"],
+    # fc["stage"]["stage"], fc["dilution"]["flag"] — none of which exist — so
+    # every stock silently accrued ~35 phantom trap points (the MSFT VALUE TRAP bug).
+    buffett_score = fc.get("buffett_score", {}).get("pass", 0)
+
+    dil_status = fc.get("dilution", {}).get("status", "gray")     # green|gray|red
+    _dil_raw   = fc.get("dilution", {}).get("yoy_change", "")
+    try:
+        dilution_pct = float(str(_dil_raw).replace("%", "").replace("+", "")) if _dil_raw not in ("", "N/A") else 0
+    except ValueError:
+        dilution_pct = 0
+    if dil_status == "green":
+        dilution_flag = "BUYBACK"
+    elif dil_status == "red" and dilution_pct > 10:
+        dilution_flag = "TOXIC"
+    elif dil_status == "red":
+        dilution_flag = "WARNING"
+    else:
+        dilution_flag = "CLEAN"
+
+    _runway_months = fc.get("runway", {}).get("months")
+    runway_years   = round(_runway_months / 12.0, 1) if isinstance(_runway_months, (int, float)) else None
+    cash           = fc.get("runway", {}).get("cash") or 0
+
+    _node = fc.get("stage", {}).get("current_node", "")
+    # Numeric scale the rules below expect: 1=Early, 2=Growth, 3=Mature, 0=Decline
+    stage = (1 if _node.startswith("Early") else
+             3 if _node.startswith("Mature") else
+             0 if _node.startswith("Decline") else 2)
+
+    de_ratio = m.get("debt_to_equity")
 
     # Is it optically "cheap"? (traditional value screen)
     optically_cheap = pe is not None and 0 < pe < 18
@@ -657,13 +699,9 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         trap_score += 10
         warnings.append(f"⚠️ Weak balance sheet {buffett_score}/5 — limited financial buffer for downturn")
 
-    if not retained_grow:
-        trap_score += 15
-        warnings.append("⚠️ Retained earnings declining or negative — losses compounding, not reversing")
-
-    if preferred and preferred > 0:
+    if fc.get("eps_predictability", {}).get("status") == "red":
         trap_score += 10
-        warnings.append(f"⚠️ Preferred stock ${preferred/1e6:.0f}M — hybrid financing signals balance sheet stress")
+        warnings.append("⚠️ Erratic or declining EPS history — earnings power unreliable")
 
     if rg < -5:
         trap_score += 20
@@ -686,13 +724,9 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         value_score += 20
         reasons.append(f"✅ {'Share buybacks reducing float' if dilution_flag == 'BUYBACK' else 'Clean capital structure — no dilution'}")
 
-    if retained_grow:
+    if fc.get("eps_predictability", {}).get("status") == "green":
         value_score += 15
-        reasons.append("✅ Retained earnings growing — compounding profitability confirmed")
-
-    if has_treasury:
-        value_score += 10
-        reasons.append("✅ Treasury stock present — management returning capital to shareholders")
+        reasons.append("✅ Consistent EPS growth — compounding profitability confirmed")
 
     if stage >= 3:
         value_score += 15
@@ -702,9 +736,9 @@ def compute_value_verdict(m: dict, forensics: dict, phase: str) -> dict:
         value_score += 10
         reasons.append(f"✅ Strong operating margin {om:.1f}% — pricing power and efficiency intact")
 
-    if cash > debt and debt > 0:
+    if de_ratio is not None and de_ratio < 0.5:
         value_score += 10
-        reasons.append(f"✅ Net cash positive — company can self-fund through downturns")
+        reasons.append(f"✅ Low leverage (D/E {de_ratio:.2f}x) — company can self-fund through downturns")
 
     if rg > 3 and om > 10:
         value_score += 10
@@ -821,9 +855,10 @@ def compute_signal_with_forensics(m: dict, phase: str, forensics: dict) -> dict:
         except (ValueError, IndexError):
             pass
 
+    raw = score
     score = max(0, min(100, score))
     rec = "BUY" if score >= 70 else "HOLD" if score >= 45 else "SELL"
-    return {"score": score, "recommendation": rec, "drivers": drivers}
+    return {"score": score, "score_raw": raw, "recommendation": rec, "drivers": drivers}
 
 # ─────────────────────────── AI analysis (Groq, optional) ──────────────────
 def groq_analysis(t, m, phase, sig, forensics=None):
@@ -922,12 +957,18 @@ def format_verdict_card(sig: dict, value_verdict: dict, m: dict) -> dict:
     om  = m.get("operating_margin") or 0
     fcf = m.get("fcf_yield")
 
+    # INVARIANT: never display VALUE TRAP alongside a strong BUY — if the
+    # sub-scores and the main signal disagree that hard, the honest output is
+    # NEUTRAL, not a self-contradicting card (the MSFT bug's safety net).
+    if vv == "VALUE_TRAP" and rec == "BUY" and score >= 70:
+        vv = "NEUTRAL"
+
     # Section 1: Classification + Market Action Profile
     classification = {
         "VALUE_STOCK": "VALUE STOCK",
         "VALUE_TRAP":  "VALUE TRAP",
-        "GROWTH_PLAY": "NOT APPLICABLE",
-        "NOT_VALUE":   "NOT APPLICABLE",
+        "GROWTH_PLAY": "GROWTH PLAY — NOT A VALUE CASE",
+        "NOT_VALUE":   "NOT A VALUE PLAY",
         "NEUTRAL":     "NEUTRAL",
     }.get(vv, "NEUTRAL")
 
@@ -1064,10 +1105,23 @@ def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str 
         ai = fallback_analysis(t, m, ph["phase"], sig, forensics)
     value_verdict = compute_value_verdict(m, forensics, ph["phase"])
     verdict_card  = format_verdict_card(sig, value_verdict, m)
+    moat = ai.get("moatAssessment")
+    # Aggregate overall moat rating from the 4 lenses (was always null → UI ring showed 0)
+    if isinstance(moat, dict) and not moat.get("note"):
+        _RS = {"anti-fragile": 3, "antifragile": 3, "robust": 2, "fragile": 1}
+        _scores = [_RS.get(str((v or {}).get("rating", "")).strip().lower(), None)
+                   for v in moat.values() if isinstance(v, dict)]
+        _scores = [s for s in _scores if s]
+        if _scores:
+            _avg = round(sum(_scores) / len(_scores))
+            moat["overall_rating"] = {3: "Anti-fragile", 2: "Robust", 1: "Fragile"}[_avg]
+            moat["overall_label"]  = {3: "Strong Structural Moat", 2: "Moderate Moat", 1: "Weak or No Moat"}[_avg]
     payload = {
         "ticker": t, "name": m.get("name"), "price": m.get("price"),
         "phase": ph["phase"], "phaseSignals": ph["signals"],
         "score": sig["score"], "recommendation": sig["recommendation"],
+        "scoreRaw": sig.get("score_raw", sig["score"]),
+        "data_source": "fmp" if FMP_API_KEY else ("mock" if MOCK else "yfinance"),
         "signalDrivers": sig["drivers"], "metrics": m,
         "forensics": forensics.get("checks"),
         "verdictCard": verdict_card,
