@@ -222,6 +222,10 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
     """
     t = ticker.upper().strip()
     bm = benchmark.upper().strip()
+    # Backtests are the most expensive route (multiple FMP calls) — reuse the
+    # same per-IP limiter as /api/analyze.
+    import main
+    main._rate_limit(f"bt:{main._client_ip(request)}")
     in_set = {s.strip().upper() for s in in_on.split(",") if s.strip()}
     if not in_set:
         in_set = {"BUY"}
@@ -276,10 +280,10 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
     }
     if len(changes) < MIN_DECISION_POINTS:
         result["warning"] = (
-            f"Only {len(changes)} fundamental decision points (free tier caps periodic "
-            f"history at {LIMIT}). This equity curve is ILLUSTRATIVE, not a statistically "
-            f"valid track record. Switch BACKTEST_PERIOD=quarter, BACKTEST_LIMIT=40 on "
-            f"FMP Starter for a defensible backtest."
+            f"This backtest is based on only {len(changes)} annual filing dates — "
+            f"too few for statistical confidence. Treat it as an illustration of the "
+            f"methodology, not as evidence of performance. Quarterly-resolution "
+            f"backtests (~40 decision points) are coming as our data coverage expands."
         )
     # The signal may never fire (e.g. BUY-only on a name the model only ever rated
     # HOLD). That makes vol/Sharpe/win-rate mathematically undefined -> NaN. NaN is
