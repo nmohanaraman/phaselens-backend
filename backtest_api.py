@@ -247,6 +247,15 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
 
     positions = _positions_from_signals(dates, changes, in_set)
 
+    # Auto-fallback: if the requested mode never puts us in the market (e.g.
+    # BUY-only on a name the model only ever rated HOLD), rerun as BUY+HOLD and
+    # SAY SO — a silently flat line looks broken; a silently switched mode lies.
+    auto_switched = False
+    if in_set == {"BUY"} and not any(positions):
+        in_set = {"BUY", "HOLD"}
+        positions = _positions_from_signals(dates, changes, in_set)
+        auto_switched = True
+
     s_eq, s_pos = engine.simulate(tp, lambda _p: positions)
     bh_eq, bh_pos = engine.simulate(tp, engine.buy_and_hold)
     bm_eq, bm_pos = engine.simulate(bp, engine.buy_and_hold)
@@ -276,7 +285,13 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
     # HOLD). That makes vol/Sharpe/win-rate mathematically undefined -> NaN. NaN is
     # NOT valid JSON and breaks JSON.parse in the browser, so scrub non-finite
     # floats to null. The frontend already renders null metrics as an en-dash.
-    if result["strategy"].get("exposure") in (0, 0.0):
+    if auto_switched:
+        result["note"] = (
+            "The signal never rated this stock BUY over the available history, so a "
+            "BUY-only strategy would have stayed 100% in cash. Auto-switched to "
+            "'BUY or HOLD' so you can see how the signal actually behaved."
+        )
+    elif result["strategy"].get("exposure") in (0, 0.0):
         result["note"] = (
             f"The PhaseLens signal was never {in_on} over the available history, so the "
             f"strategy stayed in cash (flat line). Try the 'BUY or HOLD' mode, or upgrade "
