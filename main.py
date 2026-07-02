@@ -485,7 +485,7 @@ def compute_forensics(m: dict, deep: dict) -> dict:
         "value": f"{len(eps_hist)} years data",
         "status": eps_status,
         "label": eps_label,
-        "history": [round(e,2) for e in eps_hist],
+        "history": [round(e,2) for e in reversed(eps_hist)],  # display oldest→newest (chronological)
     }
     if eps_status=="green":  drivers.append(f"+5: EPS growing consistently for 3+ years")
     elif eps_status=="red":  drivers.append(f"-8: Negative or erratic EPS — unpredictable earnings")
@@ -560,7 +560,9 @@ def compute_forensics(m: dict, deep: dict) -> dict:
     om = m.get("operating_margin") or 0
     if rg > 30 and fcf_abs <= 0:
         stage_node, stage_status = "Early Stage / Venture",   "blue"
-    elif 15 <= rg <= 30:
+    elif rg > 15:
+        # Covers 15-30 AND hypergrowth (>30) with positive FCF — previously the
+        # >30 + positive-FCF case fell through to Decline (NVDA bug).
         stage_node, stage_status = "Growth Phase",            "green"
     elif 0 <= rg < 15 and om > 5:
         stage_node, stage_status = "Mature / Cash Cow",       "green"
