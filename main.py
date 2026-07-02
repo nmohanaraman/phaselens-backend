@@ -182,7 +182,7 @@ def verify_firebase_token(token: str) -> dict:
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired — sign in again")
     except pyjwt.PyJWTError as exc:
-        raise HTTPException(401, f"Invalid token: {exc}")
+        raise HTTPException(401, "Invalid token — sign in again")
     email = (claims.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(401, "Token has no email")
@@ -209,6 +209,7 @@ def validate_ticker(raw: str) -> str:
     """Uppercase, strip, and allow only real ticker chars. Blocks URL/param
     injection into the FMP request and rejects junk that would burn API quota."""
     t = (raw or "").upper().strip()
+    t = t.replace(".", "-")   # BRK.B → BRK-B: FMP uses dash format for share classes
     if not _VALID_TICKER.match(t):
         raise HTTPException(400, "Invalid ticker symbol")
     return t
@@ -364,7 +365,9 @@ def fetch_stock(ticker: str) -> dict:
                 "market_cap":       mc,
             }
         except Exception as exc:
-            raise HTTPException(503, f"Market data unavailable for {t}: {exc}. Set FMP_API_KEY on Render for reliable data.")
+            logging.getLogger("uvicorn.error").warning(
+                "yfinance fallback(%s) failed: %s", t, _scrub_secrets(str(exc)))
+            raise HTTPException(503, f"Market data temporarily unavailable for {t}. Please try again shortly.")
     _stock_cache[t] = (time.time() + STOCK_TTL, data)
     return data
 
