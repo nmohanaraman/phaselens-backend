@@ -868,18 +868,20 @@ def groq_analysis(t, m, phase, sig, forensics=None):
     forensics_ctx = ""
     if forensics and forensics.get("checks"):
         fc = forensics["checks"]
+        _run = fc.get("runway", {})
+        _yrs = round(_run.get("months") / 12.0, 1) if isinstance(_run.get("months"), (int, float)) else "self-sustaining"
         forensics_ctx = (
             f" FORENSIC DATA: "
-            f"Business Stage: {fc.get('stage',{}).get('label','Unknown')}. "
-            f"Cash Runway: {fc.get('cash_runway',{}).get('years','N/A')} years. "
-            f"Dilution Flag: {fc.get('dilution',{}).get('flag','Unknown')} "
-            f"(shares changed {fc.get('dilution',{}).get('dilution_pct','N/A')}% YoY). "
-            f"Buffett Balance Sheet: {fc.get('buffett',{}).get('total_pass',0)}/5 checks passed "
-            f"(Cash>Debt:{fc.get('buffett',{}).get('cash_gt_debt',{}).get('pass','?')}, "
-            f"D/E<0.8:{fc.get('buffett',{}).get('debt_to_equity',{}).get('pass','?')}, "
-            f"NoPreferred:{fc.get('buffett',{}).get('zero_preferred',{}).get('pass','?')}, "
-            f"RetainedGrowth:{fc.get('buffett',{}).get('retained_earnings_growing',{}).get('pass','?')}, "
-            f"TreasuryStock:{fc.get('buffett',{}).get('treasury_stock',{}).get('pass','?')})."
+            f"Business Stage: {fc.get('stage',{}).get('current_node','Unknown')}. "
+            f"Cash Runway: {_yrs} years. "
+            f"Dilution: {fc.get('dilution',{}).get('message','Unknown')} "
+            f"({fc.get('dilution',{}).get('yoy_change','N/A')} YoY). "
+            f"Buffett Balance Sheet: {fc.get('buffett_score',{}).get('pass',0)}/5 checks passed "
+            f"(ROIC:{fc.get('roic',{}).get('status','?')}, "
+            f"GrossMargin:{fc.get('gross_margin',{}).get('status','?')}, "
+            f"D/E:{fc.get('debt_to_equity',{}).get('status','?')}, "
+            f"FCFYield:{fc.get('fcf_yield',{}).get('status','?')}, "
+            f"EPSPredictability:{fc.get('eps_predictability',{}).get('status','?')})."
         )
 
     prompt = (
@@ -1137,6 +1139,15 @@ def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str 
         "generated_at": now_iso(),
     }
     _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)
+    # ── v2 enrichments (non-blocking; panels hide in UI when absent) ──
+    try:
+        import features_v2
+        payload["peerComparison"] = features_v2.peer_comparison(t, m)
+        payload["entryContext"]   = features_v2.entry_context(t, m)
+        payload["verification"]   = features_v2.verify_price(t, m.get("price"))
+        _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)  # recache enriched
+    except Exception as _v2exc:
+        logging.getLogger("uvicorn.error").warning("v2 enrichment(%s): %s", t, _scrub_secrets(str(_v2exc)))
     # Auto-log verdict to analyses table for admin dashboard
     try:
         fc    = forensics.get("checks", {})
@@ -1374,3 +1385,10 @@ try:
 except Exception as _bt_exc:   # never let an optional module break the core API
     import logging
     logging.getLogger("uvicorn.error").warning("Backtest router not loaded: %s", _bt_exc)
+
+try:
+    from features_v2 import router as v2_router
+    app.include_router(v2_router)
+except Exception as _v2_exc:
+    import logging
+    logging.getLogger("uvicorn.error").warning("v2 features router not loaded: %s", _v2_exc)
