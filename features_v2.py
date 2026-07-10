@@ -65,7 +65,11 @@ def resolve_peers(t: str, n: int = 3, exchange: str = "US") -> list[str]:
 
 
 def peer_comparison(t: str, m: dict) -> dict | None:
-    """Target vs up to 3 peers on the core ratio set. None = hide panel."""
+    """Target vs up to 3 peers. BUDGET-CRITICAL: exactly ONE FMP call per peer
+    (ratios-ttm), never the full fetch_stock (~5 calls each) — the original
+    version quadrupled the per-analysis FMP cost and could exhaust the free
+    daily quota in ~12 analyses. Peer FCF yield / revenue growth are omitted
+    by design (each would cost an extra call per peer)."""
     import main
     peers = resolve_peers(t)
     if not peers:
@@ -73,18 +77,27 @@ def peer_comparison(t: str, m: dict) -> dict | None:
     rows = []
     for p in peers[:3]:
         try:
-            pm = main.fetch_stock(p)   # shares the 15-min cache
+            if main.MOCK:
+                rows.append({"ticker": p, "pe_ratio": 25.0, "gross_margin": 45.0,
+                             "operating_margin": 20.0, "debt_to_equity": 0.8})
+                continue
+            rr = main._fmp_get(f"ratios-ttm?symbol={p}")
+            r0 = rr[0] if isinstance(rr, list) and rr else {}
+            def pv(key, pct=False):
+                v = r0.get(key)
+                if v in (None, 0):
+                    return None
+                return round(v * 100, 2) if pct else round(v, 2)
             rows.append({
                 "ticker": p,
-                "pe_ratio": pm.get("pe_ratio"),
-                "gross_margin": pm.get("gross_margin"),
-                "operating_margin": pm.get("operating_margin"),
-                "fcf_yield": pm.get("fcf_yield"),
-                "debt_to_equity": pm.get("debt_to_equity"),
-                "revenue_growth": pm.get("revenue_growth"),
+                "pe_ratio": pv("priceToEarningsRatioTTM"),
+                "gross_margin": pv("grossProfitMarginTTM", pct=True),
+                "operating_margin": pv("operatingProfitMarginTTM", pct=True),
+                "debt_to_equity": pv("debtToEquityRatioTTM"),
             })
         except Exception:
             continue
+    rows = [r for r in rows if any(v is not None for k, v in r.items() if k != "ticker")]
     if not rows:
         return None
 
@@ -92,7 +105,7 @@ def peer_comparison(t: str, m: dict) -> dict | None:
         vals = sorted(r[key] for r in rows if isinstance(r.get(key), (int, float)))
         return vals[len(vals)//2] if vals else None
 
-    fields = ["pe_ratio","gross_margin","operating_margin","fcf_yield","debt_to_equity","revenue_growth"]
+    fields = ["pe_ratio", "gross_margin", "operating_margin", "debt_to_equity"]
     medians = {f: med(f) for f in fields}
     LOWER_BETTER = {"pe_ratio", "debt_to_equity"}
     stance = {}
