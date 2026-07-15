@@ -252,3 +252,133 @@ def api_debate(ticker: str, request: Request, rounds: int = 2):
                "disclaimer": analysis.get("disclaimer")}
     _DEBATE_CACHE[t] = (time.time() + _DEBATE_TTL, payload)
     return payload
+
+
+# ══════════════════ Epic 1: Forensic Fair Value Estimator ══════════════════
+# Zero FMP calls — consumes data already fetched by /api/analyze.
+# Backend returns the INPUTS + defaults; the frontend re-computes live as the
+# user drags the discount-rate slider (same formulas, mirrored in JS), so
+# stress-testing costs nothing.
+def fair_value(t: str, m: dict, deep: dict) -> dict | None:
+    """Three baselines:
+       EPV        — Greenwald Earnings Power Value: normalized EPS / r. Zero growth.
+       FCF_YIELD  — zero-growth FCF perpetuity: (FCF/shares) / r.
+       DCF        — GROWTH-DEPENDENT (user's explicit choice to include): 5y FCF
+                    at capped growth g, terminal growth 2.5%, discounted at r.
+       Exclusion logic: a model that would produce a nonsensical value (negative
+       or zero inputs) returns null rather than a fake number."""
+    try:
+        price  = m.get("price")
+        shares = deep.get("shares_outstanding") or 0
+        fcf    = deep.get("fcf") or 0
+        eps_hist = [e for e in (m.get("eps_history") or []) if isinstance(e, (int, float))]
+        if not isinstance(price, (int, float)) or price <= 0:
+            return None
+
+        R_DEFAULT, TG, G_CAP = 0.09, 0.025, 0.10
+        rg = m.get("revenue_growth")
+        g = max(0.0, min((rg or 0) / 100.0, G_CAP))   # capped, floor 0 — conservative
+
+        eps_norm = round(sum(eps_hist[:4]) / min(len(eps_hist), 4), 2) if eps_hist else None
+        fcf_ps   = round(fcf / shares, 4) if shares and fcf else None
+
+        def _epv(r):        # normalized earnings / r
+            return round(eps_norm / r, 2) if eps_norm and eps_norm > 0 else None
+        def _perp(r):       # zero-growth FCF perpetuity
+            return round(fcf_ps / r, 2) if fcf_ps and fcf_ps > 0 else None
+        def _dcf(r):        # 5y growing FCF + Gordon terminal — growth-dependent
+            if not fcf_ps or fcf_ps <= 0 or r <= TG:
+                return None
+            pv, c = 0.0, fcf_ps
+            for yr in range(1, 6):
+                c *= (1 + g)
+                pv += c / ((1 + r) ** yr)
+            terminal = (c * (1 + TG)) / (r - TG)
+            pv += terminal / ((1 + r) ** 5)
+            return round(pv, 2)
+
+        r = R_DEFAULT
+        models = {
+            "epv":  {"label": "Earnings Power Value", "kind": "DETERMINISTIC",
+                     "value": _epv(r),
+                     "formula": "Normalized EPS (4y avg) / discount rate",
+                     "inputs": {"eps_norm": eps_norm, "r": r}},
+            "fcf_perpetuity": {"label": "FCF Perpetuity (zero growth)", "kind": "DETERMINISTIC",
+                     "value": _perp(r),
+                     "formula": "(TTM FCF / shares) / discount rate",
+                     "inputs": {"fcf_per_share": fcf_ps, "r": r}},
+            "dcf":  {"label": "Conservative DCF", "kind": "GROWTH-DEPENDENT",
+                     "value": _dcf(r),
+                     "formula": "5y FCF @ g (capped 10%), terminal g 2.5%, discounted at r",
+                     "inputs": {"fcf_per_share": fcf_ps, "g": round(g, 4),
+                                "terminal_g": TG, "r": r}},
+        }
+        if all(mm["value"] is None for mm in models.values()):
+            return {"status": "INSUFFICIENT_DATA",
+                    "reason": "Negative or missing FCF/EPS — a fair value computed from these inputs would be meaningless."}
+        for key, mm in models.items():
+            if mm["value"]:
+                mm["vs_price_pct"] = round((mm["value"] - price) / price * 100, 1)
+        return {"status": "OK", "price": price, "r_default": R_DEFAULT,
+                "r_range": [0.06, 0.14], "models": models,
+                "note": ("EPV and FCF Perpetuity assume ZERO growth — deterministic by design. "
+                         "The DCF depends on a growth assumption (g shown) and is labeled accordingly. "
+                         "None of these are price targets or advice.")}
+    except Exception:
+        return None
+
+
+# ═══════════ Epic 2: Deterministic Structural Insights (no LLM) ═══════════
+# Plain-English strengths/vulnerabilities derived ONLY from rule thresholds.
+# Every bullet cites its value+threshold and carries an anchor (which tab /
+# metric produced it). Predictive language is impossible by construction —
+# these are canned strings keyed to deterministic checks.
+def structural_insights(m: dict, forensics: dict) -> dict:
+    fc = (forensics or {}).get("checks", {})
+    S, V = [], []
+    def add(lst, text, anchor):
+        lst.append({"text": text, "anchor": anchor})
+
+    de = m.get("debt_to_equity")
+    if isinstance(de, (int, float)):
+        if de < 0.5:  add(S, f"Low leverage: D/E of {de:.2f}x means minimal debt burden (threshold: <0.5x).", "forensics")
+        elif de > 2:  add(V, f"High leverage: D/E of {de:.2f}x exceeds the 2.0x risk threshold.", "forensics")
+
+    gm = m.get("gross_margin")
+    if isinstance(gm, (int, float)):
+        if gm > 40:   add(S, f"Pricing power: {gm:.0f}% gross margin clears the 40% quality bar.", "metrics")
+        elif gm < 20 and gm >= 0: add(V, f"Thin gross margin ({gm:.0f}%): little pricing cushion against cost shocks.", "metrics")
+
+    om = m.get("operating_margin")
+    if isinstance(om, (int, float)) and om < 0:
+        add(V, f"Operating losses: operating margin is {om:.0f}% — the core business currently loses money.", "metrics")
+
+    fy = m.get("fcf_yield")
+    if isinstance(fy, (int, float)):
+        if fy > 3:    add(S, f"Cash generative: {fy:.1f}% FCF yield (threshold: >3%).", "metrics")
+        elif fy < 0:  add(V, "Negative free cash flow: operations consume more cash than they produce.", "metrics")
+
+    roic = (fc.get("roic") or {})
+    if roic.get("status") == "green":
+        add(S, f"Efficient capital allocation: ROIC check passed ({roic.get('value','')}).", "forensics")
+    elif roic.get("status") == "red":
+        add(V, f"Weak returns on capital: ROIC check failed ({roic.get('value','')}).", "forensics")
+
+    eps = (fc.get("eps_predictability") or {})
+    if eps.get("status") == "green":
+        add(S, "Predictable earnings: EPS has grown consistently across the reported history.", "forensics")
+    elif eps.get("status") == "red":
+        add(V, "Erratic earnings: EPS history is volatile or declining.", "forensics")
+
+    dil = (fc.get("dilution") or {})
+    if dil.get("status") == "green":
+        add(S, "Shareholder-friendly: share count is shrinking (buybacks).", "forensics")
+    elif dil.get("status") == "red":
+        add(V, f"Dilution: share count grew {dil.get('yoy_change','')} YoY.", "forensics")
+
+    run = (fc.get("runway") or {})
+    if isinstance(run.get("months"), (int, float)) and run["months"] < 24:
+        add(V, f"Limited cash runway: ~{int(run['months'])} months at the current burn rate.", "forensics")
+
+    return {"strengths": S, "vulnerabilities": V,
+            "method": "Deterministic rule engine — every bullet cites its threshold; no model-generated language."}
