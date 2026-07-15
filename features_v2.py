@@ -577,18 +577,18 @@ THEMES = [
      "filter": lambda r: (
          (_v(r, "debtToEquityRatioTTM") or 99) < 0.5 and
          (_pct(r, "grossProfitMarginTTM") or 0) > 40 and
-         (_pct(r, "returnOnEquityTTM") or 0) > 15),
-     "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROE > 15%"},
+         (_pct(r, "_roic") or 0) > 15),
+     "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROIC > 15%"},
     {"id": "cash_machines", "name": "Cash Machines",
      "desc": "Businesses generating outsized free cash flow relative to their market value.",
      "filter": lambda r: (
-         (_pct(r, "freeCashFlowYieldTTM") or 0) > 5 and
+         (_pct(r, "_fcf_yield") or 0) > 5 and
          (_pct(r, "operatingProfitMarginTTM") or 0) > 15),
      "criteria": "FCF Yield > 5% AND Operating Margin > 15%"},
     {"id": "growth_quality", "name": "Quality Growth",
      "desc": "Fast growers that aren't sacrificing margins or balance sheet health.",
      "filter": lambda r: (
-         (_v(r, "revenueGrowthTTM") or 0) > 0.20 and
+         (_v(r, "_rev_growth") or 0) > 0.20 and
          (_pct(r, "grossProfitMarginTTM") or 0) > 35 and
          0 < (_v(r, "priceToEarningsRatioTTM") or 0) < 40),
      "criteria": "Revenue Growth > 20% AND Gross Margin > 35% AND P/E < 40x"},
@@ -604,44 +604,45 @@ THEMES = [
      "filter": lambda r: (
          0 < (_v(r, "priceToEarningsRatioTTM") or 0) < 15 and
          (_pct(r, "grossProfitMarginTTM") or 0) > 30 and
-         (_pct(r, "freeCashFlowYieldTTM") or 0) > 3),
+         (_pct(r, "_fcf_yield") or 0) > 3),
      "criteria": "P/E < 15x AND Gross Margin > 30% AND FCF Yield > 3%"},
 ]
 
 
-def _fetch_ratio_rows(main) -> list[dict]:
-    """Get TTM ratio rows for screening. Try bulk (CSV or JSON); if gated or
-    failing, fall back to the seed universe one ticker at a time."""
-    import httpx as _hx
-    # Attempt bulk — raw fetch so we can handle CSV
-    try:
-        url = f"https://financialmodelingprep.com/stable/ratios-ttm-bulk?apikey={main.FMP_API_KEY}"
-        r = _hx.get(url, timeout=25)
-        if r.status_code == 200:
-            body = r.text
-            if body.lstrip().startswith("[") or body.lstrip().startswith("{"):
-                data = r.json()
-                rows = data if isinstance(data, list) else []
-            else:  # CSV
-                reader = _csv.DictReader(_io.StringIO(body))
-                rows = list(reader)
-            if len(rows) > 100:
-                return rows
-        else:
-            log.info("screens bulk status %s — using seed universe", r.status_code)
-    except Exception as exc:
-        log.info("screens bulk failed (%s) — using seed universe", str(exc)[:100])
-
-    # Fallback: seed universe, one ratios-ttm per ticker (~50 calls, cached 24h)
-    rows = []
-    for sym in SEED_UNIVERSE:
+def _fetch_screen_rows(main) -> list[dict]:
+    """Merged screening rows for the seed universe. Per ticker (threaded):
+       ratios-ttm      -> P/E, margins, D/E, dividend yield
+       key-metrics-ttm -> FCF yield, ROIC          (NOT in ratios-ttm!)
+       income (2yr)    -> revenue growth           (in NO ttm snapshot)
+    Field names are the ones main.fetch_stock uses in production — verified
+    against live FMP responses, not guessed. 3 calls x 50 tickers = 150,
+    under the 300/min Starter limit, threaded ~8s, cached 24h.
+    (v2 lesson: ratios-ttm alone lacks FCF yield / growth / ROE -> 4 of 5
+    themes screened against nonexistent fields and returned zero.)"""
+    def one(sym):
         try:
+            row = {"symbol": sym}
             rr = main._fmp_get(f"ratios-ttm?symbol={sym}")
             if isinstance(rr, list) and rr:
-                row = dict(rr[0]); row["symbol"] = sym
-                rows.append(row)
+                row.update(rr[0])
+            km = main._fmp_get(f"key-metrics-ttm?symbol={sym}")
+            if isinstance(km, list) and km:
+                row["_fcf_yield"] = km[0].get("freeCashFlowYieldTTM")
+                row["_roic"]      = km[0].get("returnOnInvestedCapitalTTM")
+            inc = main._fmp_get(f"income-statement?symbol={sym}&limit=2&period=annual")
+            if isinstance(inc, list) and len(inc) >= 2:
+                r_new = inc[0].get("revenue") or 0
+                r_old = inc[1].get("revenue") or 0
+                if r_old:
+                    row["_rev_growth"] = (r_new - r_old) / abs(r_old)
+            return row
         except Exception:
-            continue
+            return None
+    rows = []
+    with _fut.ThreadPoolExecutor(max_workers=5) as ex:
+        for res in ex.map(one, SEED_UNIVERSE):
+            if res and len(res) > 1:
+                rows.append(res)
     return rows
 
 
@@ -660,7 +661,7 @@ def api_screens(request: Request):
         _SCREENS_CACHE["all"] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
         return payload
 
-    rows = _fetch_ratio_rows(main)
+    rows = _fetch_screen_rows(main)
     if not rows:
         raise HTTPException(503, "Screening data temporarily unavailable.")
 
@@ -679,7 +680,7 @@ def api_screens(request: Request):
                         "gm": _pct(row, "grossProfitMarginTTM"),
                         "om": _pct(row, "operatingProfitMarginTTM"),
                         "de": round(_v(row, "debtToEquityRatioTTM"), 2) if _v(row, "debtToEquityRatioTTM") is not None else None,
-                        "fcf_yield": _pct(row, "freeCashFlowYieldTTM"),
+                        "fcf_yield": _pct(row, "_fcf_yield"),
                         "div_yield": _pct(row, "dividendYieldTTM"),
                     })
             except Exception:
@@ -695,7 +696,7 @@ def api_screens(request: Request):
     payload = {
         "themes": results,
         "generated_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
-        "universe": "market-wide bulk" if len(rows) > 100 else f"seed universe ({len(rows)} liquid US large-caps)",
+        "universe": f"curated universe: {len(rows)} liquid US large-caps (bulk endpoints deferred)",
         "survivorship_warning": (
             "IMPORTANT: Performance charts show hypothetical past returns of stocks that pass "
             "TODAY's screen — not what the screen would have selected historically. Stocks look "
@@ -801,7 +802,7 @@ def _mock_screens():
         "themes": [
             {"id": "fortress", "name": "Buffett Fortresses",
              "desc": "Ultra-low leverage, wide margins, high returns on capital.",
-             "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROE > 15%",
+             "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROIC > 15%",
              "count": 3,
              "stocks": [
                  {"ticker": "MSFT", "pe": 32.1, "gm": 69.8, "om": 44.2, "de": 0.35},
