@@ -31,16 +31,48 @@ from __future__ import annotations
 
 import os
 import math
+import logging
 from fastapi import APIRouter, HTTPException, Request
 
 import backtest_engine as engine
 
 router = APIRouter()
 
-# ── Tier config: flip these two env vars to go free -> Starter ──────────────
-PERIOD = os.getenv("BACKTEST_PERIOD", "annual")          # "annual" | "quarter"
-LIMIT  = int(os.getenv("BACKTEST_LIMIT", "5"))           # free cap = 5; Starter = 40
-PERIODS_PER_YEAR = 4.0 if PERIOD == "quarter" else 1.0   # for annualizing metrics
+# ── Tier resolution: SELF-DETECTING with optional env override ──────────────
+# Old design required BACKTEST_PERIOD/BACKTEST_LIMIT env vars — a human step
+# that silently failed on any typo (and did, in production, July 2026).
+# New design: on first use, probe one quarterly statement request. If the plan
+# grants it (Starter+), run quarter/40; if FMP refuses (free tier), annual/5.
+# Env vars still work as explicit overrides; values are normalized; anything
+# unrecognized falls through to auto-detection instead of breaking.
+_TIER_CACHE: dict = {}   # {"period": str, "limit": int} once resolved
+
+def _tier() -> tuple[str, int]:
+    import main
+    if _TIER_CACHE:
+        return _TIER_CACHE["period"], _TIER_CACHE["limit"]
+    env_p = (os.getenv("BACKTEST_PERIOD") or "").strip().lower()
+    env_l = (os.getenv("BACKTEST_LIMIT") or "").strip()
+    if env_p in ("quarter", "annual"):
+        limit = int(env_l) if env_l.isdigit() else (40 if env_p == "quarter" else 5)
+        _TIER_CACHE.update(period=env_p, limit=limit, source="env")
+    elif main.MOCK:
+        _TIER_CACHE.update(period="annual", limit=5, source="mock")
+    else:
+        # Probe: does the plan grant quarterly history beyond the free cap?
+        try:
+            probe = main._fmp_get("income-statement?symbol=AAPL&limit=40&period=quarter")
+            granted = isinstance(probe, list) and len(probe) > 5
+        except Exception:
+            granted = False
+        if granted:
+            _TIER_CACHE.update(period="quarter", limit=40, source="auto-detected")
+        else:
+            _TIER_CACHE.update(period="annual", limit=5, source="auto-detected")
+        logging.getLogger("uvicorn.error").info(
+            "Backtest tier auto-detected: %s/%s", _TIER_CACHE["period"], _TIER_CACHE["limit"])
+    return _TIER_CACHE["period"], _TIER_CACHE["limit"]
+
 MIN_DECISION_POINTS = 10                                  # below this = anecdotal
 
 
@@ -51,7 +83,8 @@ def _periodic(endpoint: str, ticker: str) -> list[dict]:
     import main
     if main.MOCK:
         return []  # MOCK path handled by caller via _mock_series
-    raw = main._fmp_get(f"{endpoint}?symbol={ticker}&limit={LIMIT}&period={PERIOD}")
+    p, l = _tier()
+    raw = main._fmp_get(f"{endpoint}?symbol={ticker}&limit={l}&period={p}")
     return raw if isinstance(raw, list) else []
 
 
@@ -275,12 +308,12 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
         "benchmark_curve": {"equity": bm_eq, **engine.compute_metrics(bm_eq, bm_pos, ppy)},
         "signal_log": changes,                 # the as-of BUY/HOLD/SELL stream
         "decision_points": len(changes),
-        "tier": {"period": PERIOD, "limit": LIMIT},
+        "tier": {"period": _tier()[0], "limit": _tier()[1], "source": _TIER_CACHE.get("source")},
         "disclaimer": engine.DISCLAIMER,
     }
     if len(changes) < MIN_DECISION_POINTS:
         result["warning"] = (
-            f"This backtest is based on only {len(changes)} annual filing dates — "
+            f"This backtest is based on only {len(changes)} {_tier()[0]}ly filing dates — " if _tier()[0]=="quarter" else f"This backtest is based on only {len(changes)} annual filing dates — "
             f"too few for statistical confidence. Treat it as an illustration of the "
             f"methodology, not as evidence of performance. Quarterly-resolution "
             f"backtests (~40 decision points) are coming as our data coverage expands."
