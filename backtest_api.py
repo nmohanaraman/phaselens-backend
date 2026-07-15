@@ -253,6 +253,16 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
       in_on=BUY        -> hold only while the signal is BUY  (default)
       in_on=BUY,HOLD   -> hold while BUY or HOLD (exit only on SELL)
     """
+    try:
+        return _run_backtest(ticker, request, benchmark, in_on)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger("uvicorn.error").exception("backtest(%s) unhandled:", ticker)
+        raise HTTPException(500, f"Backtest failed unexpectedly. The error has been logged.")
+
+
+def _run_backtest(ticker: str, request: Request, benchmark: str, in_on: str):
     t = ticker.upper().strip()
     bm = benchmark.upper().strip()
     # Backtests are the most expensive route (multiple FMP calls) — reuse the
@@ -312,11 +322,12 @@ def api_backtest(ticker: str, request: Request, benchmark: str = "SPY", in_on: s
         "disclaimer": engine.DISCLAIMER,
     }
     if len(changes) < MIN_DECISION_POINTS:
+        p, _ = _tier()
+        freq = "quarterly" if p == "quarter" else "annual"
         result["warning"] = (
-            f"This backtest is based on only {len(changes)} {_tier()[0]}ly filing dates — " if _tier()[0]=="quarter" else f"This backtest is based on only {len(changes)} annual filing dates — "
+            f"This backtest is based on only {len(changes)} {freq} filing dates — "
             f"too few for statistical confidence. Treat it as an illustration of the "
-            f"methodology, not as evidence of performance. Quarterly-resolution "
-            f"backtests (~40 decision points) are coming as our data coverage expands."
+            f"methodology, not as evidence of performance."
         )
     # The signal may never fire (e.g. BUY-only on a name the model only ever rated
     # HOLD). That makes vol/Sharpe/win-rate mathematically undefined -> NaN. NaN is
