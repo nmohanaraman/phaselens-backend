@@ -235,14 +235,26 @@ def _rate_limit(key: str):
                 _rl_buckets.pop(k, None)
 
 def _fmp_get(path: str) -> dict:
-    """Call FMP API and return parsed JSON. Raises HTTPException on failure."""
+    """Call FMP API and return parsed JSON. Raises HTTPException on failure.
+    SECURITY: never let httpx embed the full URL (contains apikey) in any
+    exception — catch status errors explicitly and scrub before re-raising."""
     url = f"https://financialmodelingprep.com/stable/{path}&apikey={FMP_API_KEY}"
-    r = httpx.get(url, timeout=15)
+    try:
+        r = httpx.get(url, timeout=15)
+    except Exception as exc:
+        logging.getLogger("uvicorn.error").warning("FMP network error: %s", _scrub_secrets(str(exc)))
+        raise HTTPException(503, "Market data temporarily unavailable. Please try again shortly.")
     if r.status_code == 401:
         raise HTTPException(503, "FMP API key invalid — check FMP_API_KEY on Render")
+    if r.status_code in (402, 403):
+        # Tier-gated endpoint (e.g. key-metrics quarterly on Starter) — callers
+        # must handle this as "data not available" rather than crashing.
+        raise HTTPException(402, f"FMP endpoint requires a higher plan: {path.split('?')[0]}")
     if r.status_code == 429:
-        raise HTTPException(503, "FMP daily limit reached (250/day on free plan)")
-    r.raise_for_status()
+        raise HTTPException(503, "FMP rate limit reached — please wait a moment")
+    if r.status_code >= 400:
+        logging.getLogger("uvicorn.error").warning("FMP %s: %s", r.status_code, _scrub_secrets(r.text[:200]))
+        raise HTTPException(503, "Market data temporarily unavailable. Please try again shortly.")
     data = r.json()
     if isinstance(data, dict) and "Error Message" in data:
         raise HTTPException(503, f"FMP error: {data['Error Message']}")
@@ -1145,6 +1157,8 @@ def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str 
         payload["peerComparison"] = features_v2.peer_comparison(t, m)
         payload["entryContext"]   = features_v2.entry_context(t, m)
         payload["verification"]   = features_v2.verify_price(t, m.get("price"))
+        payload["fairValue"]      = features_v2.fair_value(t, m, deep)
+        payload["structuralInsights"] = features_v2.structural_insights(m, forensics)
         _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)  # recache enriched
     except Exception as _v2exc:
         logging.getLogger("uvicorn.error").warning("v2 enrichment(%s): %s", t, _scrub_secrets(str(_v2exc)))

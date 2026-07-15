@@ -211,6 +211,100 @@ check("debate errors genericized (no raw exc to user)", 'HTTPException(503, "Deb
 check("no apikey literals in frontend", "apikey" not in js2.lower())
 
 
+print("\n=== 12. EPIC 1: fair value engine ===")
+fv = features_v2.fair_value("X", {"price":100.0,"eps_history":[8,7,6,5],"revenue_growth":12},
+                            {"shares_outstanding":1_000_000, "fcf":9_000_000})
+check("fair_value returns OK structure", fv and fv.get("status")=="OK")
+if fv:
+    # hand-check: eps_norm=(8+7+6+5)/4=6.5 → EPV=6.5/.09=72.22
+    check("EPV hand-check (6.5/.09=72.22)", abs(fv["models"]["epv"]["value"]-72.22)<0.01, str(fv["models"]["epv"]["value"]))
+    # fcf_ps=9 → perpetuity 9/.09=100.00
+    check("FCF perpetuity hand-check (9/.09=100)", abs(fv["models"]["fcf_perpetuity"]["value"]-100.0)<0.01)
+    # DCF hand-check: g capped at 10%: 5y PV + terminal
+    g,r,tg,c,pv=0.10,0.09,0.025,9.0,0.0
+    for y in range(1,6):
+        c*=1+g; pv+=c/((1+r)**y)
+    pv+=(c*(1+tg))/(r-tg)/((1+r)**5)
+    check("DCF hand-check matches", abs(fv["models"]["dcf"]["value"]-round(pv,2))<0.01, f"{fv['models']['dcf']['value']} vs {round(pv,2)}")
+    check("DCF labeled GROWTH-DEPENDENT", fv["models"]["dcf"]["kind"]=="GROWTH-DEPENDENT")
+    check("deterministic models labeled", fv["models"]["epv"]["kind"]=="DETERMINISTIC")
+    check("vs_price_pct computed", fv["models"]["fcf_perpetuity"]["vs_price_pct"]==0.0)
+fv2 = features_v2.fair_value("X", {"price":50.0,"eps_history":[-2,-3],"revenue_growth":5},
+                             {"shares_outstanding":1_000_000,"fcf":-4_000_000})
+check("exclusion: negative FCF+EPS → INSUFFICIENT_DATA", fv2 and fv2.get("status")=="INSUFFICIENT_DATA")
+fv3 = features_v2.fair_value("X", {"price":None,"eps_history":[5]}, {})
+check("no price → None (panel hides)", fv3 is None)
+
+print("\n=== 13. EPIC 2: structural insights ===")
+si = features_v2.structural_insights(
+  {"debt_to_equity":0.3,"gross_margin":55,"operating_margin":25,"fcf_yield":4.2},
+  {"checks":{"roic":{"status":"green","value":"22%"},"eps_predictability":{"status":"green"},
+             "dilution":{"status":"green"},"runway":{"months":999}}})
+check("quality profile → strengths populated, no vulnerabilities", len(si["strengths"])>=4 and len(si["vulnerabilities"])==0, f"S={len(si['strengths'])} V={len(si['vulnerabilities'])}")
+si2 = features_v2.structural_insights(
+  {"debt_to_equity":3.1,"gross_margin":12,"operating_margin":-9,"fcf_yield":-2},
+  {"checks":{"roic":{"status":"red","value":"2%"},"eps_predictability":{"status":"red"},
+             "dilution":{"status":"red","yoy_change":"+14%"},"runway":{"months":11}}})
+check("distressed profile → vulnerabilities populated", len(si2["vulnerabilities"])>=6 and len(si2["strengths"])==0)
+banned=["undervalued","likely to rise","strong buy","will ","target price"]
+alltext=" ".join(x["text"].lower() for x in si["strengths"]+si2["vulnerabilities"])
+check("predictive-language filter (no banned terms)", not any(b in alltext for b in banned))
+check("every bullet carries an anchor", all(x.get("anchor") in ("metrics","forensics") for x in si["strengths"]+si2["vulnerabilities"]))
+
+print("\n=== 14. EPICS E2E + FRONTEND ===")
+main._analysis_cache.clear(); main._rl_buckets.clear()
+r = client.get("/api/analyze/DEMO3")
+check("analyze carries fairValue + structuralInsights", r.status_code==200 and "fairValue" in r.json() and "structuralInsights" in r.json())
+js3 = max(re.findall(r"<script[^>]*>(.*?)</script>", open("app.html").read(), re.S), key=len)
+check("fair value panel + slider + inspect-math", "_fairValuePanel" in js3 and "_fvSlide" in js3 and "Inspect the math" in js3)
+check("client-side formulas mirror backend", "_fvCompute" in js3 and "Math.pow(1+r,y)" in js3)
+check("GROWTH-DEPENDENT badge rendered", "GROWTH-DEPENDENT" in js3)
+check("insights two-column + anchors + not-AI label", "_insightsPanel" in js3 and "RULE-BASED, NOT AI" in js3 and "setTab(\\'" in js3)
+
+print("\n=== 15. TIER SELF-DETECTION (env-var bug fix) ===")
+import backtest_api as bt
+# explicit env honored + normalized
+bt._TIER_CACHE.clear(); os.environ["BACKTEST_PERIOD"]="quarter"; os.environ["BACKTEST_LIMIT"]="40"
+check("explicit env quarter/40 honored", bt._tier()==("quarter",40))
+bt._TIER_CACHE.clear(); os.environ["BACKTEST_PERIOD"]="  QUARTER "; os.environ["BACKTEST_LIMIT"]="oops"
+check("messy env normalized (case/space, bad limit->default 40)", bt._tier()==("quarter",40))
+# garbage period ignored -> auto path; in MOCK auto = annual/5
+bt._TIER_CACHE.clear(); os.environ["BACKTEST_PERIOD"]="yearly"; os.environ.pop("BACKTEST_LIMIT",None)
+check("unrecognized env falls to auto (mock->annual/5)", bt._tier()==("annual",5))
+# unset env in mock
+bt._TIER_CACHE.clear(); os.environ.pop("BACKTEST_PERIOD",None)
+check("no env in mock -> annual/5, source=mock", bt._tier()==("annual",5) and bt._TIER_CACHE.get("source")=="mock")
+# probe failure path degrades to annual (simulate by forcing non-mock w/ failing fetch)
+bt._TIER_CACHE.clear()
+_old_mock, _old_get = main.MOCK, main._fmp_get
+main.MOCK=False; main._fmp_get=lambda *_a,**_k: (_ for _ in ()).throw(RuntimeError("net down"))
+check("probe failure degrades safely to annual/5", bt._tier()==("annual",5))
+# probe success path detects quarter/40
+bt._TIER_CACHE.clear(); main._fmp_get=lambda *_a,**_k: [{"q":i} for i in range(40)]
+check("probe granting 40 rows -> quarter/40 auto-detected", bt._tier()==("quarter",40) and bt._TIER_CACHE.get("source")=="auto-detected")
+main.MOCK, main._fmp_get = _old_mock, _old_get
+bt._TIER_CACHE.clear()
+check("response tier carries source field", "_TIER_CACHE.get(\"source\")" in open("backtest_api.py").read())
+
+print("\n=== 16. TODAY'S RADAR ===")
+main._analysis_cache.clear(); main._rl_buckets.clear()
+rr = client.get("/api/radar")
+check("radar 200 in mock", rr.status_code == 200)
+if rr.status_code == 200:
+    rj = rr.json()
+    check("radar has picks array", isinstance(rj.get("picks"), list) and len(rj["picks"]) >= 1)
+    check("radar has method transparency", "Deterministic" in rj.get("method", ""))
+    check("radar has disclaimer", "Not investment advice" in rj.get("disclaimer", ""))
+    check("radar picks carry reasons", all("reasons" in p for p in rj["picks"]))
+    check("radar picks carry ai_context in mock", any(p.get("ai_context") for p in rj["picks"]))
+js4 = max(re.findall(r"<script[^>]*>(.*?)</script>", open("app.html").read(), re.S), key=len)
+check("radar renderer in frontend", "renderRadar" in js4 and "fetchRadar" in js4)
+check("radar zone in research view", "radar-zone" in js4)
+check("radar cards show methodology", "How these were selected" in js4)
+check("radar AI label separated", "AI SUMMARY" in js4)
+check("radar cards are clickable (openAnalysis)", "openAnalysis" in js4 and "renderRadar" in js4)
+check("radar tagged RULE-BASED NOT PREDICTIONS", "RULE-BASED, NOT PREDICTIONS" in js4)
+
 print("\n" + "="*54)
 print(f"RESULT: {len(PASS)} passed, {len(FAIL)} failed")
 for n, d in FAIL: print(f"  FAILED: {n} {d}")

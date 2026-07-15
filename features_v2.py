@@ -382,3 +382,431 @@ def structural_insights(m: dict, forensics: dict) -> dict:
 
     return {"strengths": S, "vulnerabilities": V,
             "method": "Deterministic rule engine — every bullet cites its threshold; no model-generated language."}
+
+
+# ════════════════ TODAY'S RADAR — deterministic daily stock surfacing ════════
+# NOT "AI picks." Selection is 100% rule-based from FMP market-activity data
+# + PhaseLens quality filters. Groq writes a one-line context per stock AFTER
+# selection (labeled "AI summary"), never influences inclusion or ranking.
+# Cost: ~5-8 FMP calls, 1 Groq call, cached 24h.
+_RADAR_CACHE: dict = {}   # {"expiry": float, "payload": dict}
+_RADAR_TTL = 24 * 3600
+
+@router.get("/api/radar")
+def api_radar(request: Request):
+    import main
+    main._rate_limit(f"radar:{main._client_ip(request)}")
+    hit = _RADAR_CACHE.get("data")
+    if hit and hit["expiry"] > time.time():
+        return hit["payload"]
+
+    if main.MOCK:
+        payload = _mock_radar()
+        _RADAR_CACHE["data"] = {"expiry": time.time() + _RADAR_TTL, "payload": payload}
+        return payload
+
+    # Step 1: gather candidates from market activity (2 FMP calls)
+    candidates = {}
+    for endpoint in ("most-actives", "biggest-gainers"):
+        try:
+            raw = main._fmp_get(endpoint)
+            if isinstance(raw, list):
+                for item in raw[:20]:
+                    sym = item.get("symbol")
+                    if sym and sym not in candidates:
+                        candidates[sym] = {
+                            "ticker": sym,
+                            "name": item.get("name") or item.get("companyName") or sym,
+                            "price": item.get("price"),
+                            "change_pct": item.get("changesPercentage"),
+                            "volume": item.get("volume"),
+                            "source": endpoint,
+                        }
+        except Exception:
+            continue
+
+    if not candidates:
+        return {"status": "UNAVAILABLE", "picks": [],
+                "note": "Market activity data is temporarily unavailable."}
+
+    # Step 2: score candidates with lightweight ratios (1 FMP call each, stop at 12)
+    scored = []
+    checked = 0
+    for sym, info in list(candidates.items())[:25]:
+        if checked >= 12:
+            break
+        try:
+            rr = main._fmp_get(f"ratios-ttm?symbol={sym}")
+            r0 = rr[0] if isinstance(rr, list) and rr else {}
+            checked += 1
+
+            pe = r0.get("priceToEarningsRatioTTM")
+            gm = r0.get("grossProfitMarginTTM")
+            om = r0.get("operatingProfitMarginTTM")
+            de = r0.get("debtToEquityRatioTTM")
+            fy = r0.get("freeCashFlowYieldTTM") if r0.get("freeCashFlowYieldTTM") else None
+
+            # Quality score: simple deterministic tally
+            quality = 0
+            reasons = []
+            if isinstance(gm, (int, float)) and gm > 0.40:
+                quality += 2; reasons.append(f"Gross margin {gm*100:.0f}% (>40%)")
+            if isinstance(om, (int, float)) and om > 0.15:
+                quality += 2; reasons.append(f"Op margin {om*100:.0f}% (>15%)")
+            if isinstance(pe, (int, float)) and 0 < pe < 35:
+                quality += 2; reasons.append(f"P/E {pe:.1f}x (<35x)")
+            if isinstance(de, (int, float)) and de < 1.5:
+                quality += 1; reasons.append(f"D/E {de:.1f}x (<1.5x)")
+            if isinstance(fy, (int, float)) and fy > 0.02:
+                quality += 1; reasons.append(f"FCF yield {fy*100:.1f}% (>2%)")
+
+            if quality >= 3:
+                info.update(quality=quality, reasons=reasons,
+                            pe=round(pe, 1) if isinstance(pe, (int, float)) else None,
+                            gm=round(gm*100, 1) if isinstance(gm, (int, float)) else None,
+                            om=round(om*100, 1) if isinstance(om, (int, float)) else None)
+                scored.append(info)
+        except Exception:
+            continue
+
+    # Step 3: rank by quality score desc, take top 5
+    scored.sort(key=lambda x: x.get("quality", 0), reverse=True)
+    picks = scored[:5]
+
+    # Step 4: Groq one-liner per pick (optional, non-blocking)
+    if picks and main.GROQ_API_KEY:
+        try:
+            import httpx as _hx
+            tickers_ctx = "; ".join(
+                f"{p['ticker']} ({p['name']}, P/E {p.get('pe','?')}, GM {p.get('gm','?')}%, "
+                f"chg {p.get('change_pct','?')}%)" for p in picks)
+            prompt = (
+                "For each stock below, write ONE short factual sentence (max 15 words) "
+                "explaining why it's interesting today based ONLY on the data shown. "
+                "No predictions, no 'buy/sell', no superlatives. Format: TICKER: sentence\n\n"
+                + tickers_ctx)
+            r = _hx.post("https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {main.GROQ_API_KEY}"},
+                json={"model": "llama-3.1-8b-instant",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0.3, "max_tokens": 250}, timeout=15)
+            r.raise_for_status()
+            lines = r.json()["choices"][0]["message"]["content"].strip().split("\n")
+            for line in lines:
+                if ":" in line:
+                    tk = line.split(":")[0].strip().upper()
+                    ctx = ":".join(line.split(":")[1:]).strip()
+                    for p in picks:
+                        if p["ticker"] == tk:
+                            p["ai_context"] = ctx
+        except Exception:
+            pass  # picks still work without AI context
+
+    payload = {
+        "status": "OK",
+        "picks": picks,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+        "method": ("Deterministic screen: today's most active + biggest gainers filtered by "
+                   "gross margin >40%, operating margin >15%, P/E <35x, D/E <1.5x, FCF yield >2%. "
+                   "Ranked by quality score. AI context lines are labeled separately."),
+        "disclaimer": "Not investment advice. Stocks surfaced by market activity + quality filters, not predictions.",
+    }
+    _RADAR_CACHE["data"] = {"expiry": time.time() + _RADAR_TTL, "payload": payload}
+    return payload
+
+
+def _mock_radar():
+    return {
+        "status": "OK",
+        "picks": [
+            {"ticker": "DEMO1", "name": "DemoCorp Alpha", "price": 142.50, "change_pct": 4.2,
+             "quality": 7, "reasons": ["Gross margin 55% (>40%)", "Op margin 22% (>15%)", "P/E 18.5x (<35x)"],
+             "ai_context": "Strong margins and reasonable valuation amid sector rotation."},
+            {"ticker": "DEMO2", "name": "DemoCorp Beta", "price": 89.30, "change_pct": 3.1,
+             "quality": 6, "reasons": ["Gross margin 48% (>40%)", "P/E 21.0x (<35x)", "D/E 0.6x (<1.5x)"],
+             "ai_context": "Low leverage and steady margins on above-average volume."},
+            {"ticker": "DEMO3", "name": "DemoCorp Gamma", "price": 215.80, "change_pct": 2.8,
+             "quality": 5, "reasons": ["Op margin 19% (>15%)", "FCF yield 3.2% (>2%)"],
+             "ai_context": "Cash generation improving quarter-over-quarter."},
+        ],
+        "generated_at": "2026-07-15 14:00 UTC",
+        "method": "Deterministic screen (mock data).",
+        "disclaimer": "Not investment advice. Stocks surfaced by market activity + quality filters, not predictions.",
+    }
+
+
+# ═══════════ THEMED FUNDAMENTAL SCREENS ("ProPicks" analog) ═══════════════
+# One `ratios-ttm-bulk` call for the whole market → filter into themes →
+# for each theme's constituents, pull free daily prices → equal-weight
+# hypothetical performance vs SPY. Cached 24h. Survivorship bias disclosed.
+import backtest_engine as engine
+
+_SCREENS_CACHE: dict = {}
+_SCREENS_TTL = 24 * 3600
+
+THEMES = [
+    {"id": "fortress", "name": "Buffett Fortresses",
+     "desc": "Ultra-low leverage, wide margins, high returns on capital.",
+     "filter": lambda r: (
+         _v(r, "debtToEquityRatioTTM") is not None and _v(r, "debtToEquityRatioTTM") < 0.5 and
+         _pct(r, "grossProfitMarginTTM") is not None and _pct(r, "grossProfitMarginTTM") > 40 and
+         _pct(r, "returnOnEquityTTM") is not None and _pct(r, "returnOnEquityTTM") > 15),
+     "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROE > 15%"},
+    {"id": "cash_machines", "name": "Cash Machines",
+     "desc": "Businesses generating outsized free cash flow relative to their market value.",
+     "filter": lambda r: (
+         _pct(r, "freeCashFlowYieldTTM") is not None and _pct(r, "freeCashFlowYieldTTM") > 5 and
+         _pct(r, "operatingProfitMarginTTM") is not None and _pct(r, "operatingProfitMarginTTM") > 15),
+     "criteria": "FCF Yield > 5% AND Operating Margin > 15%"},
+    {"id": "growth_quality", "name": "Quality Growth",
+     "desc": "Fast growers that aren't sacrificing margins or balance sheet health.",
+     "filter": lambda r: (
+         _v(r, "revenueGrowthTTM") is not None and _v(r, "revenueGrowthTTM") > 0.20 and
+         _pct(r, "grossProfitMarginTTM") is not None and _pct(r, "grossProfitMarginTTM") > 35 and
+         _v(r, "priceToEarningsRatioTTM") is not None and 0 < _v(r, "priceToEarningsRatioTTM") < 40),
+     "criteria": "Revenue Growth > 20% AND Gross Margin > 35% AND P/E < 40x"},
+    {"id": "dividend", "name": "Dividend Compounders",
+     "desc": "Paying and growing dividends while maintaining financial discipline.",
+     "filter": lambda r: (
+         _pct(r, "dividendYieldTTM") is not None and _pct(r, "dividendYieldTTM") > 2 and
+         _v(r, "debtToEquityRatioTTM") is not None and _v(r, "debtToEquityRatioTTM") < 1.0 and
+         _pct(r, "operatingProfitMarginTTM") is not None and _pct(r, "operatingProfitMarginTTM") > 10),
+     "criteria": "Dividend Yield > 2% AND D/E < 1.0x AND Operating Margin > 10%"},
+    {"id": "undervalued", "name": "Undervalued Quality",
+     "desc": "Cheap on earnings with solid margins and cash generation.",
+     "filter": lambda r: (
+         _v(r, "priceToEarningsRatioTTM") is not None and 0 < _v(r, "priceToEarningsRatioTTM") < 15 and
+         _pct(r, "grossProfitMarginTTM") is not None and _pct(r, "grossProfitMarginTTM") > 30 and
+         _pct(r, "freeCashFlowYieldTTM") is not None and _pct(r, "freeCashFlowYieldTTM") > 3),
+     "criteria": "P/E < 15x AND Gross Margin > 30% AND FCF Yield > 3%"},
+]
+
+def _v(r, key):
+    v = r.get(key)
+    return float(v) if v is not None else None
+
+def _pct(r, key):
+    v = _v(r, key)
+    return round(v * 100, 2) if v is not None else None
+
+
+@router.get("/api/screens")
+def api_screens(request: Request, theme: str = ""):
+    import main
+    main._rate_limit(f"screens:{main._client_ip(request)}")
+    hit = _SCREENS_CACHE.get("all")
+    if hit and hit["expiry"] > time.time():
+        if theme:
+            return next((t for t in hit["payload"]["themes"] if t["id"] == theme), hit["payload"])
+        return hit["payload"]
+
+    if main.MOCK:
+        payload = _mock_screens()
+        _SCREENS_CACHE["all"] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
+        return payload
+
+    # Step 1: one bulk call for the whole market
+    try:
+        bulk = main._fmp_get("ratios-ttm-bulk")
+        if not isinstance(bulk, list):
+            raise ValueError("bulk returned non-list")
+    except Exception as exc:
+        log.warning("screens bulk fetch: %s", str(exc)[:200])
+        raise HTTPException(503, "Screening data temporarily unavailable.")
+
+    # Step 2: filter into themes
+    results = []
+    for th in THEMES:
+        passing = []
+        for row in bulk:
+            sym = row.get("symbol")
+            if not sym or not isinstance(sym, str) or "." in sym:
+                continue  # skip ADRs, foreign listings
+            try:
+                if th["filter"](row):
+                    passing.append({
+                        "ticker": sym,
+                        "pe": round(_v(row, "priceToEarningsRatioTTM") or 0, 1),
+                        "gm": _pct(row, "grossProfitMarginTTM"),
+                        "om": _pct(row, "operatingProfitMarginTTM"),
+                        "de": round(_v(row, "debtToEquityRatioTTM") or 0, 2),
+                        "fcf_yield": _pct(row, "freeCashFlowYieldTTM"),
+                        "div_yield": _pct(row, "dividendYieldTTM"),
+                    })
+            except Exception:
+                continue
+        # Sort by a simple composite: lower P/E + higher margin
+        passing.sort(key=lambda x: (-(x.get("gm") or 0), (x.get("pe") or 99)))
+        passing = passing[:15]  # cap at 15 per theme
+
+        # Step 3: equal-weight hypothetical performance (free prices, no FMP cost)
+        perf = _theme_performance(passing, main)
+
+        # Step 4: Groq context (one call per theme, non-blocking)
+        ai_context = ""
+        if passing and main.GROQ_API_KEY:
+            try:
+                import httpx as _hx
+                tickers = ", ".join(p["ticker"] for p in passing[:10])
+                prompt = (
+                    f"Theme: '{th['name']}' — criteria: {th['criteria']}. "
+                    f"Today's qualifying stocks include: {tickers}. "
+                    f"Write 2 factual sentences about what these companies have in common "
+                    f"structurally. No predictions, no buy/sell language. Max 40 words.")
+                resp = _hx.post("https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {main.GROQ_API_KEY}"},
+                    json={"model": "llama-3.1-8b-instant",
+                          "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0.3, "max_tokens": 80}, timeout=15)
+                resp.raise_for_status()
+                ai_context = resp.json()["choices"][0]["message"]["content"].strip()
+            except Exception:
+                pass
+
+        results.append({
+            "id": th["id"], "name": th["name"], "desc": th["desc"],
+            "criteria": th["criteria"], "count": len(passing),
+            "stocks": passing, "performance": perf,
+            "ai_context": ai_context,
+        })
+
+    payload = {
+        "themes": results,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+        "survivorship_warning": (
+            "IMPORTANT: These charts show hypothetical past performance of stocks that "
+            "pass TODAY's screen. This is NOT what the screen would have returned historically — "
+            "the composition changes over time. Stocks that look good today may look good partly "
+            "BECAUSE they went up. This is survivorship bias, clearly disclosed. "
+            "Forward-tracked performance (starting from today) will be added once storage is wired."),
+        "disclaimer": "Not investment advice. Deterministic screens with transparent criteria.",
+    }
+    _SCREENS_CACHE["all"] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
+    if theme:
+        return next((t for t in results if t["id"] == theme), payload)
+    return payload
+
+
+def _theme_performance(stocks: list, main_mod) -> dict | None:
+    """Equal-weight hypothetical returns of current constituents vs SPY.
+    Uses FREE daily prices — zero FMP cost. Returns None if insufficient data."""
+    if not stocks or main_mod.MOCK:
+        return {"note": "Performance data unavailable in this mode.",
+                "returns": {"1y": None, "3y": None, "5y": None}}
+    try:
+        # Get SPY prices once
+        spy_raw = main_mod._fmp_get("historical-price-eod/full?symbol=SPY")
+        if isinstance(spy_raw, dict):
+            spy_raw = spy_raw.get("historical") or []
+        spy_by_date = {r["date"]: r["close"] for r in spy_raw if r.get("date") and r.get("close")}
+        if len(spy_by_date) < 250:
+            return None
+
+        # Get prices for each constituent (cached by main's 15-min cache or FMP's CDN)
+        stock_series = {}
+        for s in stocks[:10]:  # cap to control FMP calls
+            try:
+                raw = main_mod._fmp_get(f"historical-price-eod/full?symbol={s['ticker']}")
+                if isinstance(raw, dict):
+                    raw = raw.get("historical") or []
+                stock_series[s["ticker"]] = {r["date"]: r["close"] for r in raw
+                                              if r.get("date") and r.get("close")}
+            except Exception:
+                continue
+
+        if len(stock_series) < 3:
+            return None
+
+        # Find common dates (intersection of all stocks + SPY)
+        common_dates = set(spy_by_date.keys())
+        for sd in stock_series.values():
+            common_dates &= set(sd.keys())
+        dates = sorted(common_dates)
+        if len(dates) < 250:
+            return None
+
+        # Equal-weight portfolio: daily returns averaged across constituents
+        n = len(stock_series)
+        tickers = list(stock_series.keys())
+        port_curve = [10000.0]
+        spy_curve = [10000.0]
+        for i in range(1, len(dates)):
+            d0, d1 = dates[i-1], dates[i]
+            # portfolio: equal-weight daily return
+            daily_rets = []
+            for tk in tickers:
+                p0 = stock_series[tk].get(d0)
+                p1 = stock_series[tk].get(d1)
+                if p0 and p1 and p0 > 0:
+                    daily_rets.append(p1 / p0 - 1)
+            if daily_rets:
+                avg_ret = sum(daily_rets) / len(daily_rets)
+                port_curve.append(port_curve[-1] * (1 + avg_ret))
+            else:
+                port_curve.append(port_curve[-1])
+            # SPY
+            sp0 = spy_by_date.get(d0, 0)
+            sp1 = spy_by_date.get(d1, 0)
+            if sp0 and sp0 > 0:
+                spy_curve.append(spy_curve[-1] * (sp1 / sp0))
+            else:
+                spy_curve.append(spy_curve[-1])
+
+        # Compute period returns
+        def ret_for_period(days):
+            if len(dates) < days:
+                return None, None
+            idx = len(dates) - days
+            p_ret = round((port_curve[-1] / port_curve[idx] - 1) * 100, 1)
+            s_ret = round((spy_curve[-1] / spy_curve[idx] - 1) * 100, 1)
+            return p_ret, s_ret
+
+        r1y = ret_for_period(252)
+        r3y = ret_for_period(756)
+        r5y = ret_for_period(1260)
+
+        # Downsample curves for charting (~100 points)
+        step = max(1, len(dates) // 100)
+        chart_dates = [dates[i] for i in range(0, len(dates), step)]
+        chart_port = [round(port_curve[i] / port_curve[0] * 100, 1) for i in range(0, len(dates), step)]
+        chart_spy = [round(spy_curve[i] / spy_curve[0] * 100, 1) for i in range(0, len(dates), step)]
+
+        return {
+            "constituents": len(stock_series),
+            "returns": {
+                "1y": {"portfolio": r1y[0], "spy": r1y[1]} if r1y[0] is not None else None,
+                "3y": {"portfolio": r3y[0], "spy": r3y[1]} if r3y[0] is not None else None,
+                "5y": {"portfolio": r5y[0], "spy": r5y[1]} if r5y[0] is not None else None,
+            },
+            "chart": {"dates": chart_dates, "portfolio": chart_port, "spy": chart_spy},
+        }
+    except Exception as exc:
+        log.warning("theme_performance: %s", str(exc)[:200])
+        return None
+
+
+def _mock_screens():
+    return {
+        "themes": [
+            {"id": "fortress", "name": "Buffett Fortresses",
+             "desc": "Ultra-low leverage, wide margins, high returns on capital.",
+             "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROE > 15%",
+             "count": 3,
+             "stocks": [
+                 {"ticker": "MSFT", "pe": 32.1, "gm": 69.8, "om": 44.2, "de": 0.35},
+                 {"ticker": "AAPL", "pe": 28.5, "gm": 45.9, "om": 30.1, "de": 0.48},
+                 {"ticker": "NVDA", "pe": 38.2, "gm": 72.1, "om": 54.3, "de": 0.29},
+             ],
+             "performance": {"constituents": 3,
+                "returns": {"1y": {"portfolio": 42.5, "spy": 18.3},
+                            "3y": {"portfolio": 95.2, "spy": 31.1},
+                            "5y": None},
+                "chart": {"dates": ["2024-07","2025-01","2025-07","2026-01","2026-07"],
+                          "portfolio": [100, 112, 128, 135, 142],
+                          "spy": [100, 105, 110, 113, 118]}},
+             "ai_context": "These companies share fortress-grade balance sheets with minimal debt and exceptional margin structures."},
+        ],
+        "generated_at": "2026-07-15 14:00 UTC",
+        "survivorship_warning": "IMPORTANT: Hypothetical past performance of TODAY's constituents — survivorship bias disclosed.",
+        "disclaimer": "Not investment advice. Deterministic screens with transparent criteria.",
+    }

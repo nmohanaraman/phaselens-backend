@@ -79,13 +79,20 @@ MIN_DECISION_POINTS = 10                                  # below this = anecdot
 # ── FMP periodic fetch (uses main's _fmp_get so it shares your key/base URL) ─
 def _periodic(endpoint: str, ticker: str) -> list[dict]:
     """One periodic statement, newest->oldest. Function-level import of main
-    avoids a circular import (main.py includes this router at the bottom)."""
+    avoids a circular import (main.py includes this router at the bottom).
+    Returns [] on any error (402 = tier-gated, network, etc) — callers build
+    the best series they can from whatever endpoints succeed."""
     import main
     if main.MOCK:
-        return []  # MOCK path handled by caller via _mock_series
+        return []
     p, l = _tier()
-    raw = main._fmp_get(f"{endpoint}?symbol={ticker}&limit={l}&period={p}")
-    return raw if isinstance(raw, list) else []
+    try:
+        raw = main._fmp_get(f"{endpoint}?symbol={ticker}&limit={l}&period={p}")
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        # 402 (tier-gated endpoint like key-metrics quarterly on Starter),
+        # network errors, or any other failure — degrade, don't crash.
+        return []
 
 
 def _historical_prices(ticker: str) -> list[dict]:
