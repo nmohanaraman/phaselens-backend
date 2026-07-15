@@ -144,6 +144,30 @@ import subprocess
 out = subprocess.run([sys.executable, "test_engine.py"], capture_output=True, text=True).stdout
 check("engine invariants suite green", "[ALL TESTS PASSED]" in out)
 
+print("\n=== 17. THEMED SCREENS v2 (fast list + lazy perf) ===")
+import features_v2
+main._analysis_cache.clear(); main._rl_buckets.clear()
+sc = client.get("/api/screens")
+check("screens 200 in mock", sc.status_code == 200)
+if sc.status_code == 200:
+    sj = sc.json()
+    check("screens: themes present", isinstance(sj.get("themes"), list) and len(sj["themes"]) >= 1)
+    check("screens: criteria printed per theme", all(t.get("criteria") for t in sj["themes"]))
+    check("screens: survivorship warning present", "survivorship" in sj.get("survivorship_warning","").lower() or "TODAY" in sj.get("survivorship_warning",""))
+    check("screens: performance NOT inline (lazy design)", all(t.get("performance") is None for t in sj["themes"]))
+sp = client.get("/api/screens/fortress/performance")
+check("theme performance endpoint 200 in mock", sp.status_code == 200)
+if sp.status_code == 200:
+    pj = sp.json()
+    check("perf: returns + chart shape", "returns" in pj and "chart" in pj and len(pj["chart"]["dates"]) >= 3)
+check("filters: fortress logic", features_v2.THEMES[0]["filter"]({"debtToEquityRatioTTM":0.3,"grossProfitMarginTTM":0.55,"returnOnEquityTTM":0.22}))
+check("filters: fortress rejects leverage", not features_v2.THEMES[0]["filter"]({"debtToEquityRatioTTM":2.5,"grossProfitMarginTTM":0.55,"returnOnEquityTTM":0.22}))
+check("filters: None-safe (NA never passes)", not features_v2.THEMES[0]["filter"]({}))
+js5 = max(re.findall(r"<script[^>]*>(.*?)</script>", open("app.html").read(), re.S), key=len)
+check("frontend: lazy perf button per theme", "fetchThemePerf" in js5 and "Load performance" in js5)
+check("frontend: fetch timeout + retry (no infinite spinner)", "AbortController" in js5 and "tap to retry" in js5)
+check("frontend: Screens nav + view registered", "view-screens" in open("app.html").read() and "'screens'" in js5)
+
 print("\n" + "="*54)
 # (summary moved to end of file after v2 sections)
 

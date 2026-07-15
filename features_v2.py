@@ -535,69 +535,124 @@ def _mock_radar():
     }
 
 
-# ═══════════ THEMED FUNDAMENTAL SCREENS ("ProPicks" analog) ═══════════════
-# One `ratios-ttm-bulk` call for the whole market → filter into themes →
-# for each theme's constituents, pull free daily prices → equal-weight
-# hypothetical performance vs SPY. Cached 24h. Survivorship bias disclosed.
+# ═══════════ THEMED FUNDAMENTAL SCREENS ("ProPicks" analog) — v2 ═══════════
+# LESSONS from v1 (which hung in production): never do whole-market bulk +
+# 50 price fetches + 5 LLM calls inside ONE synchronous request.
+# v2 design:
+#   /api/screens                  → FAST: candidates + filters only (<10s)
+#   /api/screens/{id}/performance → LAZY: one theme's chart on demand (~8 calls)
+# Bulk endpoint handled as CSV (FMP bulk returns CSV, not JSON) with a
+# seed-universe fallback if the plan gates bulk (the key-metrics lesson).
 import backtest_engine as engine
+import csv as _csv
+import io as _io
 
 _SCREENS_CACHE: dict = {}
 _SCREENS_TTL = 24 * 3600
+_PERF_CACHE: dict = {}    # theme_id -> {"expiry", "payload"}
 
-THEMES = [
-    {"id": "fortress", "name": "Buffett Fortresses",
-     "desc": "Ultra-low leverage, wide margins, high returns on capital.",
-     "filter": lambda r: (
-         _v(r, "debtToEquityRatioTTM") is not None and _v(r, "debtToEquityRatioTTM") < 0.5 and
-         _pct(r, "grossProfitMarginTTM") is not None and _pct(r, "grossProfitMarginTTM") > 40 and
-         _pct(r, "returnOnEquityTTM") is not None and _pct(r, "returnOnEquityTTM") > 15),
-     "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROE > 15%"},
-    {"id": "cash_machines", "name": "Cash Machines",
-     "desc": "Businesses generating outsized free cash flow relative to their market value.",
-     "filter": lambda r: (
-         _pct(r, "freeCashFlowYieldTTM") is not None and _pct(r, "freeCashFlowYieldTTM") > 5 and
-         _pct(r, "operatingProfitMarginTTM") is not None and _pct(r, "operatingProfitMarginTTM") > 15),
-     "criteria": "FCF Yield > 5% AND Operating Margin > 15%"},
-    {"id": "growth_quality", "name": "Quality Growth",
-     "desc": "Fast growers that aren't sacrificing margins or balance sheet health.",
-     "filter": lambda r: (
-         _v(r, "revenueGrowthTTM") is not None and _v(r, "revenueGrowthTTM") > 0.20 and
-         _pct(r, "grossProfitMarginTTM") is not None and _pct(r, "grossProfitMarginTTM") > 35 and
-         _v(r, "priceToEarningsRatioTTM") is not None and 0 < _v(r, "priceToEarningsRatioTTM") < 40),
-     "criteria": "Revenue Growth > 20% AND Gross Margin > 35% AND P/E < 40x"},
-    {"id": "dividend", "name": "Dividend Compounders",
-     "desc": "Paying and growing dividends while maintaining financial discipline.",
-     "filter": lambda r: (
-         _pct(r, "dividendYieldTTM") is not None and _pct(r, "dividendYieldTTM") > 2 and
-         _v(r, "debtToEquityRatioTTM") is not None and _v(r, "debtToEquityRatioTTM") < 1.0 and
-         _pct(r, "operatingProfitMarginTTM") is not None and _pct(r, "operatingProfitMarginTTM") > 10),
-     "criteria": "Dividend Yield > 2% AND D/E < 1.0x AND Operating Margin > 10%"},
-    {"id": "undervalued", "name": "Undervalued Quality",
-     "desc": "Cheap on earnings with solid margins and cash generation.",
-     "filter": lambda r: (
-         _v(r, "priceToEarningsRatioTTM") is not None and 0 < _v(r, "priceToEarningsRatioTTM") < 15 and
-         _pct(r, "grossProfitMarginTTM") is not None and _pct(r, "grossProfitMarginTTM") > 30 and
-         _pct(r, "freeCashFlowYieldTTM") is not None and _pct(r, "freeCashFlowYieldTTM") > 3),
-     "criteria": "P/E < 15x AND Gross Margin > 30% AND FCF Yield > 3%"},
+# Fallback universe if bulk is plan-gated: liquid, well-known US names.
+SEED_UNIVERSE = [
+    "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AVGO","BRK-B","JPM",
+    "V","MA","UNH","JNJ","XOM","PG","HD","COST","ABBV","WMT",
+    "KO","PEP","MRK","ORCL","CRM","AMD","NFLX","ADBE","TMO","MCD",
+    "CSCO","ACN","LIN","ABT","INTU","TXN","QCOM","IBM","GE","CAT",
+    "NOW","ISRG","AMAT","BKNG","VZ","T","LOW","NKE","UNP","PFE",
 ]
 
 def _v(r, key):
     v = r.get(key)
-    return float(v) if v is not None else None
+    try:
+        return float(v) if v not in (None, "", "None") else None
+    except (TypeError, ValueError):
+        return None
 
 def _pct(r, key):
     v = _v(r, key)
     return round(v * 100, 2) if v is not None else None
 
+THEMES = [
+    {"id": "fortress", "name": "Buffett Fortresses",
+     "desc": "Ultra-low leverage, wide margins, high returns on capital.",
+     "filter": lambda r: (
+         (_v(r, "debtToEquityRatioTTM") or 99) < 0.5 and
+         (_pct(r, "grossProfitMarginTTM") or 0) > 40 and
+         (_pct(r, "returnOnEquityTTM") or 0) > 15),
+     "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROE > 15%"},
+    {"id": "cash_machines", "name": "Cash Machines",
+     "desc": "Businesses generating outsized free cash flow relative to their market value.",
+     "filter": lambda r: (
+         (_pct(r, "freeCashFlowYieldTTM") or 0) > 5 and
+         (_pct(r, "operatingProfitMarginTTM") or 0) > 15),
+     "criteria": "FCF Yield > 5% AND Operating Margin > 15%"},
+    {"id": "growth_quality", "name": "Quality Growth",
+     "desc": "Fast growers that aren't sacrificing margins or balance sheet health.",
+     "filter": lambda r: (
+         (_v(r, "revenueGrowthTTM") or 0) > 0.20 and
+         (_pct(r, "grossProfitMarginTTM") or 0) > 35 and
+         0 < (_v(r, "priceToEarningsRatioTTM") or 0) < 40),
+     "criteria": "Revenue Growth > 20% AND Gross Margin > 35% AND P/E < 40x"},
+    {"id": "dividend", "name": "Dividend Compounders",
+     "desc": "Paying dividends while maintaining financial discipline.",
+     "filter": lambda r: (
+         (_pct(r, "dividendYieldTTM") or 0) > 2 and
+         (_v(r, "debtToEquityRatioTTM") or 99) < 1.0 and
+         (_pct(r, "operatingProfitMarginTTM") or 0) > 10),
+     "criteria": "Dividend Yield > 2% AND D/E < 1.0x AND Operating Margin > 10%"},
+    {"id": "undervalued", "name": "Undervalued Quality",
+     "desc": "Cheap on earnings with solid margins and cash generation.",
+     "filter": lambda r: (
+         0 < (_v(r, "priceToEarningsRatioTTM") or 0) < 15 and
+         (_pct(r, "grossProfitMarginTTM") or 0) > 30 and
+         (_pct(r, "freeCashFlowYieldTTM") or 0) > 3),
+     "criteria": "P/E < 15x AND Gross Margin > 30% AND FCF Yield > 3%"},
+]
+
+
+def _fetch_ratio_rows(main) -> list[dict]:
+    """Get TTM ratio rows for screening. Try bulk (CSV or JSON); if gated or
+    failing, fall back to the seed universe one ticker at a time."""
+    import httpx as _hx
+    # Attempt bulk — raw fetch so we can handle CSV
+    try:
+        url = f"https://financialmodelingprep.com/stable/ratios-ttm-bulk?apikey={main.FMP_API_KEY}"
+        r = _hx.get(url, timeout=25)
+        if r.status_code == 200:
+            body = r.text
+            if body.lstrip().startswith("[") or body.lstrip().startswith("{"):
+                data = r.json()
+                rows = data if isinstance(data, list) else []
+            else:  # CSV
+                reader = _csv.DictReader(_io.StringIO(body))
+                rows = list(reader)
+            if len(rows) > 100:
+                return rows
+        else:
+            log.info("screens bulk status %s — using seed universe", r.status_code)
+    except Exception as exc:
+        log.info("screens bulk failed (%s) — using seed universe", str(exc)[:100])
+
+    # Fallback: seed universe, one ratios-ttm per ticker (~50 calls, cached 24h)
+    rows = []
+    for sym in SEED_UNIVERSE:
+        try:
+            rr = main._fmp_get(f"ratios-ttm?symbol={sym}")
+            if isinstance(rr, list) and rr:
+                row = dict(rr[0]); row["symbol"] = sym
+                rows.append(row)
+        except Exception:
+            continue
+    return rows
+
 
 @router.get("/api/screens")
-def api_screens(request: Request, theme: str = ""):
+def api_screens(request: Request):
+    """FAST path: themes + qualifying stocks. Performance is a separate,
+    per-theme lazy endpoint."""
     import main
     main._rate_limit(f"screens:{main._client_ip(request)}")
     hit = _SCREENS_CACHE.get("all")
     if hit and hit["expiry"] > time.time():
-        if theme:
-            return next((t for t in hit["payload"]["themes"] if t["id"] == theme), hit["payload"])
         return hit["payload"]
 
     if main.MOCK:
@@ -605,181 +660,137 @@ def api_screens(request: Request, theme: str = ""):
         _SCREENS_CACHE["all"] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
         return payload
 
-    # Step 1: one bulk call for the whole market
-    try:
-        bulk = main._fmp_get("ratios-ttm-bulk")
-        if not isinstance(bulk, list):
-            raise ValueError("bulk returned non-list")
-    except Exception as exc:
-        log.warning("screens bulk fetch: %s", str(exc)[:200])
+    rows = _fetch_ratio_rows(main)
+    if not rows:
         raise HTTPException(503, "Screening data temporarily unavailable.")
 
-    # Step 2: filter into themes
     results = []
     for th in THEMES:
         passing = []
-        for row in bulk:
+        for row in rows:
             sym = row.get("symbol")
             if not sym or not isinstance(sym, str) or "." in sym:
-                continue  # skip ADRs, foreign listings
+                continue
             try:
                 if th["filter"](row):
                     passing.append({
                         "ticker": sym,
-                        "pe": round(_v(row, "priceToEarningsRatioTTM") or 0, 1),
+                        "pe": round(_v(row, "priceToEarningsRatioTTM") or 0, 1) or None,
                         "gm": _pct(row, "grossProfitMarginTTM"),
                         "om": _pct(row, "operatingProfitMarginTTM"),
-                        "de": round(_v(row, "debtToEquityRatioTTM") or 0, 2),
+                        "de": round(_v(row, "debtToEquityRatioTTM"), 2) if _v(row, "debtToEquityRatioTTM") is not None else None,
                         "fcf_yield": _pct(row, "freeCashFlowYieldTTM"),
                         "div_yield": _pct(row, "dividendYieldTTM"),
                     })
             except Exception:
                 continue
-        # Sort by a simple composite: lower P/E + higher margin
         passing.sort(key=lambda x: (-(x.get("gm") or 0), (x.get("pe") or 99)))
-        passing = passing[:15]  # cap at 15 per theme
-
-        # Step 3: equal-weight hypothetical performance (free prices, no FMP cost)
-        perf = _theme_performance(passing, main)
-
-        # Step 4: Groq context (one call per theme, non-blocking)
-        ai_context = ""
-        if passing and main.GROQ_API_KEY:
-            try:
-                import httpx as _hx
-                tickers = ", ".join(p["ticker"] for p in passing[:10])
-                prompt = (
-                    f"Theme: '{th['name']}' — criteria: {th['criteria']}. "
-                    f"Today's qualifying stocks include: {tickers}. "
-                    f"Write 2 factual sentences about what these companies have in common "
-                    f"structurally. No predictions, no buy/sell language. Max 40 words.")
-                resp = _hx.post("https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {main.GROQ_API_KEY}"},
-                    json={"model": "llama-3.1-8b-instant",
-                          "messages": [{"role": "user", "content": prompt}],
-                          "temperature": 0.3, "max_tokens": 80}, timeout=15)
-                resp.raise_for_status()
-                ai_context = resp.json()["choices"][0]["message"]["content"].strip()
-            except Exception:
-                pass
-
         results.append({
             "id": th["id"], "name": th["name"], "desc": th["desc"],
-            "criteria": th["criteria"], "count": len(passing),
-            "stocks": passing, "performance": perf,
-            "ai_context": ai_context,
+            "criteria": th["criteria"], "count": len(passing[:15]),
+            "stocks": passing[:15],
+            "performance": None,  # fetched lazily per theme
         })
 
     payload = {
         "themes": results,
         "generated_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+        "universe": "market-wide bulk" if len(rows) > 100 else f"seed universe ({len(rows)} liquid US large-caps)",
         "survivorship_warning": (
-            "IMPORTANT: These charts show hypothetical past performance of stocks that "
-            "pass TODAY's screen. This is NOT what the screen would have returned historically — "
-            "the composition changes over time. Stocks that look good today may look good partly "
-            "BECAUSE they went up. This is survivorship bias, clearly disclosed. "
-            "Forward-tracked performance (starting from today) will be added once storage is wired."),
+            "IMPORTANT: Performance charts show hypothetical past returns of stocks that pass "
+            "TODAY's screen — not what the screen would have selected historically. Stocks look "
+            "good today partly BECAUSE they went up. This is survivorship bias, disclosed plainly. "
+            "Forward tracking (from today) is the honest track record and will accrue over time."),
         "disclaimer": "Not investment advice. Deterministic screens with transparent criteria.",
     }
     _SCREENS_CACHE["all"] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
-    if theme:
-        return next((t for t in results if t["id"] == theme), payload)
     return payload
 
 
-def _theme_performance(stocks: list, main_mod) -> dict | None:
-    """Equal-weight hypothetical returns of current constituents vs SPY.
-    Uses FREE daily prices — zero FMP cost. Returns None if insufficient data."""
-    if not stocks or main_mod.MOCK:
-        return {"note": "Performance data unavailable in this mode.",
-                "returns": {"1y": None, "3y": None, "5y": None}}
+@router.get("/api/screens/{theme_id}/performance")
+def api_screen_performance(theme_id: str, request: Request):
+    """LAZY path: one theme's equal-weight constituent history vs SPY.
+    ~8 price calls, bounded, cached 24h."""
+    import main
+    main._rate_limit(f"screenperf:{main._client_ip(request)}")
+    hit = _PERF_CACHE.get(theme_id)
+    if hit and hit["expiry"] > time.time():
+        return hit["payload"]
+
+    if main.MOCK:
+        payload = {"theme": theme_id, "constituents": 3,
+                   "returns": {"1y": {"portfolio": 42.5, "spy": 18.3},
+                               "3y": {"portfolio": 95.2, "spy": 31.1}, "5y": None},
+                   "chart": {"dates": ["2024-07","2025-01","2025-07","2026-01","2026-07"],
+                             "portfolio": [100,112,128,135,142], "spy": [100,105,110,113,118]}}
+        _PERF_CACHE[theme_id] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
+        return payload
+
+    allscreens = _SCREENS_CACHE.get("all")
+    if not allscreens or allscreens["expiry"] <= time.time():
+        raise HTTPException(409, "Run /api/screens first — screen data expired.")
+    theme = next((t for t in allscreens["payload"]["themes"] if t["id"] == theme_id), None)
+    if not theme:
+        raise HTTPException(404, "Unknown theme.")
+    stocks = theme["stocks"][:8]   # bounded
+    if len(stocks) < 3:
+        raise HTTPException(503, "Too few constituents for a meaningful chart.")
+
+    perf = _theme_performance_v2(stocks, main)
+    if not perf:
+        raise HTTPException(503, "Insufficient price history for this theme.")
+    payload = {"theme": theme_id, **perf}
+    _PERF_CACHE[theme_id] = {"expiry": time.time() + _SCREENS_TTL, "payload": payload}
+    return payload
+
+
+def _theme_performance_v2(stocks: list, main_mod) -> dict | None:
+    """Equal-weight hypothetical returns of current constituents vs SPY."""
     try:
-        # Get SPY prices once
         spy_raw = main_mod._fmp_get("historical-price-eod/full?symbol=SPY")
         if isinstance(spy_raw, dict):
             spy_raw = spy_raw.get("historical") or []
         spy_by_date = {r["date"]: r["close"] for r in spy_raw if r.get("date") and r.get("close")}
         if len(spy_by_date) < 250:
             return None
-
-        # Get prices for each constituent (cached by main's 15-min cache or FMP's CDN)
         stock_series = {}
-        for s in stocks[:10]:  # cap to control FMP calls
+        for s in stocks:
             try:
                 raw = main_mod._fmp_get(f"historical-price-eod/full?symbol={s['ticker']}")
                 if isinstance(raw, dict):
                     raw = raw.get("historical") or []
-                stock_series[s["ticker"]] = {r["date"]: r["close"] for r in raw
-                                              if r.get("date") and r.get("close")}
+                series = {r["date"]: r["close"] for r in raw if r.get("date") and r.get("close")}
+                if len(series) > 250:
+                    stock_series[s["ticker"]] = series
             except Exception:
                 continue
-
         if len(stock_series) < 3:
             return None
-
-        # Find common dates (intersection of all stocks + SPY)
-        common_dates = set(spy_by_date.keys())
+        common = set(spy_by_date)
         for sd in stock_series.values():
-            common_dates &= set(sd.keys())
-        dates = sorted(common_dates)
+            common &= set(sd)
+        dates = sorted(common)
         if len(dates) < 250:
             return None
-
-        # Equal-weight portfolio: daily returns averaged across constituents
-        n = len(stock_series)
-        tickers = list(stock_series.keys())
-        port_curve = [10000.0]
-        spy_curve = [10000.0]
+        tickers = list(stock_series)
+        port, spy = [10000.0], [10000.0]
         for i in range(1, len(dates)):
             d0, d1 = dates[i-1], dates[i]
-            # portfolio: equal-weight daily return
-            daily_rets = []
-            for tk in tickers:
-                p0 = stock_series[tk].get(d0)
-                p1 = stock_series[tk].get(d1)
-                if p0 and p1 and p0 > 0:
-                    daily_rets.append(p1 / p0 - 1)
-            if daily_rets:
-                avg_ret = sum(daily_rets) / len(daily_rets)
-                port_curve.append(port_curve[-1] * (1 + avg_ret))
-            else:
-                port_curve.append(port_curve[-1])
-            # SPY
-            sp0 = spy_by_date.get(d0, 0)
-            sp1 = spy_by_date.get(d1, 0)
-            if sp0 and sp0 > 0:
-                spy_curve.append(spy_curve[-1] * (sp1 / sp0))
-            else:
-                spy_curve.append(spy_curve[-1])
-
-        # Compute period returns
-        def ret_for_period(days):
-            if len(dates) < days:
-                return None, None
-            idx = len(dates) - days
-            p_ret = round((port_curve[-1] / port_curve[idx] - 1) * 100, 1)
-            s_ret = round((spy_curve[-1] / spy_curve[idx] - 1) * 100, 1)
-            return p_ret, s_ret
-
-        r1y = ret_for_period(252)
-        r3y = ret_for_period(756)
-        r5y = ret_for_period(1260)
-
-        # Downsample curves for charting (~100 points)
-        step = max(1, len(dates) // 100)
-        chart_dates = [dates[i] for i in range(0, len(dates), step)]
-        chart_port = [round(port_curve[i] / port_curve[0] * 100, 1) for i in range(0, len(dates), step)]
-        chart_spy = [round(spy_curve[i] / spy_curve[0] * 100, 1) for i in range(0, len(dates), step)]
-
-        return {
-            "constituents": len(stock_series),
-            "returns": {
-                "1y": {"portfolio": r1y[0], "spy": r1y[1]} if r1y[0] is not None else None,
-                "3y": {"portfolio": r3y[0], "spy": r3y[1]} if r3y[0] is not None else None,
-                "5y": {"portfolio": r5y[0], "spy": r5y[1]} if r5y[0] is not None else None,
-            },
-            "chart": {"dates": chart_dates, "portfolio": chart_port, "spy": chart_spy},
-        }
+            rets = [stock_series[tk][d1]/stock_series[tk][d0]-1
+                    for tk in tickers if stock_series[tk].get(d0)]
+            port.append(port[-1] * (1 + (sum(rets)/len(rets) if rets else 0)))
+            spy.append(spy[-1] * (spy_by_date[d1]/spy_by_date[d0] if spy_by_date.get(d0) else 1))
+        def ret(days):
+            if len(dates) <= days: return None
+            i = len(dates)-days
+            return {"portfolio": round((port[-1]/port[i]-1)*100, 1),
+                    "spy": round((spy[-1]/spy[i]-1)*100, 1)}
+        step = max(1, len(dates)//100)
+        return {"constituents": len(tickers),
+                "returns": {"1y": ret(252), "3y": ret(756), "5y": ret(1260)},
+                "chart": {"dates": [dates[i] for i in range(0, len(dates), step)],
+                          "portfolio": [round(port[i]/port[0]*100, 1) for i in range(0, len(dates), step)],
+                          "spy": [round(spy[i]/spy[0]*100, 1) for i in range(0, len(dates), step)]}}
     except Exception as exc:
         log.warning("theme_performance: %s", str(exc)[:200])
         return None
@@ -795,18 +806,11 @@ def _mock_screens():
              "stocks": [
                  {"ticker": "MSFT", "pe": 32.1, "gm": 69.8, "om": 44.2, "de": 0.35},
                  {"ticker": "AAPL", "pe": 28.5, "gm": 45.9, "om": 30.1, "de": 0.48},
-                 {"ticker": "NVDA", "pe": 38.2, "gm": 72.1, "om": 54.3, "de": 0.29},
-             ],
-             "performance": {"constituents": 3,
-                "returns": {"1y": {"portfolio": 42.5, "spy": 18.3},
-                            "3y": {"portfolio": 95.2, "spy": 31.1},
-                            "5y": None},
-                "chart": {"dates": ["2024-07","2025-01","2025-07","2026-01","2026-07"],
-                          "portfolio": [100, 112, 128, 135, 142],
-                          "spy": [100, 105, 110, 113, 118]}},
-             "ai_context": "These companies share fortress-grade balance sheets with minimal debt and exceptional margin structures."},
+                 {"ticker": "NVDA", "pe": 38.2, "gm": 72.1, "om": 54.3, "de": 0.29}],
+             "performance": None},
         ],
         "generated_at": "2026-07-15 14:00 UTC",
+        "universe": "mock",
         "survivorship_warning": "IMPORTANT: Hypothetical past performance of TODAY's constituents — survivorship bias disclosed.",
         "disclaimer": "Not investment advice. Deterministic screens with transparent criteria.",
     }
