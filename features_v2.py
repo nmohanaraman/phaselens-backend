@@ -890,7 +890,7 @@ def _mock_screens():
 _QUOTES_CACHE: dict = {}   # key -> (expiry, payload)
 
 @router.get("/api/quotes")
-def api_quotes(symbols: str, request: Request):
+def api_quotes(symbols: str, request: Request, debug: bool = False):
     import main
     main._rate_limit(f"quotes:{main._client_ip(request)}")
     syms = sorted({main.validate_ticker(s) for s in symbols.split(",") if s.strip()})[:10]
@@ -905,13 +905,53 @@ def api_quotes(symbols: str, request: Request):
                               for i, s in enumerate(syms)]}
         _QUOTES_CACHE[key] = (time.time() + 600, payload)
         return payload
+
+    def _chg(r):
+        """Day-change %, defensively: FMP's /stable API renamed fields vs v3
+        (the ratios-ttm lesson). Try every known name; if only the absolute
+        'change' exists, derive the percentage from change/previousClose."""
+        for k in ("changesPercentage", "changePercentage", "changes_percentage", "percentChange"):
+            v = r.get(k)
+            if v is not None:
+                try:
+                    return float(str(v).replace("%", "").strip())
+                except (TypeError, ValueError):
+                    continue
+        ch, pr = r.get("change"), r.get("price")
+        prev = r.get("previousClose")
+        try:
+            if ch is not None:
+                base = prev if prev else (pr - ch if pr is not None else None)
+                if base:
+                    return round(float(ch) / float(base) * 100, 2)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        return None
+
+    raw = None
     try:
-        raw = main._fmp_get(f"quote?symbol={key}")
-        quotes = [{"symbol": r.get("symbol"), "price": r.get("price"),
-                   "day_change_pct": r.get("changesPercentage")}
-                  for r in raw if r.get("symbol")] if isinstance(raw, list) else []
+        if len(syms) == 1:
+            raw = main._fmp_get(f"quote?symbol={syms[0]}")
+        else:
+            # FMP documents batch-quote as its own endpoint; the comma form on
+            # /quote may silently return only the first symbol.
+            raw = main._fmp_get(f"batch-quote?symbols={key}")
+            if not (isinstance(raw, list) and len(raw) >= min(2, len(syms))):
+                raw = []
+                for s in syms:          # per-symbol fallback, bounded at 10
+                    try:
+                        rr = main._fmp_get(f"quote?symbol={s}")
+                        if isinstance(rr, list) and rr:
+                            raw.append(rr[0])
+                    except Exception:
+                        continue
     except Exception:
-        quotes = []
+        raw = []
+    quotes = [{"symbol": r.get("symbol"), "price": r.get("price"),
+               "day_change_pct": _chg(r)}
+              for r in raw if r.get("symbol")] if isinstance(raw, list) else []
     payload = {"quotes": quotes}
+    if debug:
+        payload["_raw"] = raw   # unprocessed FMP response — diagnostic only
     _QUOTES_CACHE[key] = (time.time() + 600, payload)
     return payload
