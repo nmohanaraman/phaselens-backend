@@ -815,3 +815,37 @@ def _mock_screens():
         "survivorship_warning": "IMPORTANT: Hypothetical past performance of TODAY's constituents — survivorship bias disclosed.",
         "disclaimer": "Not investment advice. Deterministic screens with transparent criteria.",
     }
+
+
+# ═══════════ BATCH QUOTES — light price/day-change for cards & pulse ════════
+# ONE FMP call for up to 10 symbols (vs ~5 calls each via fetch_stock).
+# Powers: watchlist card prices, dashboard holdings day-change, and the
+# Market Pulse portfolio-breadth mode. Cached 10 minutes.
+_QUOTES_CACHE: dict = {}   # key -> (expiry, payload)
+
+@router.get("/api/quotes")
+def api_quotes(symbols: str, request: Request):
+    import main
+    main._rate_limit(f"quotes:{main._client_ip(request)}")
+    syms = sorted({main.validate_ticker(s) for s in symbols.split(",") if s.strip()})[:10]
+    if not syms:
+        raise HTTPException(400, "No valid symbols.")
+    key = ",".join(syms)
+    hit = _QUOTES_CACHE.get(key)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    if main.MOCK:
+        payload = {"quotes": [{"symbol": s, "price": 100.0 + i, "day_change_pct": (-1) ** i * 1.2}
+                              for i, s in enumerate(syms)]}
+        _QUOTES_CACHE[key] = (time.time() + 600, payload)
+        return payload
+    try:
+        raw = main._fmp_get(f"quote?symbol={key}")
+        quotes = [{"symbol": r.get("symbol"), "price": r.get("price"),
+                   "day_change_pct": r.get("changesPercentage")}
+                  for r in raw if r.get("symbol")] if isinstance(raw, list) else []
+    except Exception:
+        quotes = []
+    payload = {"quotes": quotes}
+    _QUOTES_CACHE[key] = (time.time() + 600, payload)
+    return payload

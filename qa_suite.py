@@ -168,6 +168,21 @@ check("frontend: lazy perf button per theme", "fetchThemePerf" in js5 and "Load 
 check("frontend: fetch timeout + retry (no infinite spinner)", "AbortController" in js5 and "tap to retry" in js5)
 check("frontend: Screens nav + view registered", "view-screens" in open("app.html").read() and "'screens'" in js5)
 
+print("\n=== 18. BATCH QUOTES + v2.6 wiring ===")
+main._rl_buckets.clear()
+q = client.get("/api/quotes?symbols=AAPL,MSFT,ionq")
+check("quotes 200 in mock", q.status_code == 200)
+if q.status_code == 200:
+    qj = q.json()
+    check("quotes normalized + shaped", all(set(x) == {"symbol","price","day_change_pct"} for x in qj["quotes"]))
+    check("quotes symbols validated/uppercased", all(x["symbol"].isupper() for x in qj["quotes"]))
+qbad = client.get("/api/quotes?symbols=")
+check("quotes rejects empty", qbad.status_code == 400)
+js6 = max(re.findall(r"<script[^>]*>(.*?)</script>", open("app.html").read(), re.S), key=len)
+check("init drives pulse + quotes (not render path)", "setInterval(function(){mountMarketCore();refreshQuotes(false);}" in js6)
+check("market-hours awareness", "_marketOpen" in js6 and "America/New_York" in js6)
+check("watchlist $0 fix wired (price+dayChg update)", "it.price=q.p" in js6 and "it.dayChg=q.c" in js6)
+
 print("\n" + "="*54)
 # (summary moved to end of file after v2 sections)
 
@@ -218,11 +233,11 @@ check("debate adjudicator rendered", "Adjudicator (deterministic scorecard)" in 
 check("peer panel renderer", "_peerPanel" in js2 and "PEER COMPARISON" in js2)
 check("entry band renderer", "_entryBand" in js2 and "ENTRY CONTEXT" in js2)
 check("verification badge wired", "m-verify" in js2 and "CONFLICT" in js2)
-check("3D core lazy CDN load", "three.min.js" in js2 and "cdnjs.cloudflare.com" in js2)
-check("WebGL fallback exists", "_coreFallback" in js2)
-check("rAF pauses when hidden or detached (visibility guard)", "document.hidden||!hh.isConnected||hh.offsetWidth===0" in js2)
+check("sphere retired: no three.js anywhere", "three.min.js" not in js2 and "THREE." not in js2)
+check("Market Pulse is DOM-only, no paint dependency", "_corePaint" not in js2 and "MARKET PULSE" in js2)
+check("build stamp visible in UI (static, paint-independent)", "APP_BUILD" in js2 and "v2.6" in js2)
 check("ambient audio removed (user feedback July 10)", "toggleAmbient" not in js2 and "AudioContext" not in js2)
-check("fibonacci sphere distribution", "Math.sqrt(5)" in js2)
+check("pulse inline + init-driven + honest labels", "pulse-mood" in js2 and "MARKET PULSE" in js2 and "as of last close" in js2 and "refreshQuotes" in js2)
 check("breadth SPY fallback", "/api/stock/SPY" in js2)
 
 print("\n=== 11. CVE RE-VERIFICATION (post v2 build) ===")
