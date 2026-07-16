@@ -341,7 +341,9 @@ def structural_insights(m: dict, forensics: dict) -> dict:
 
     de = m.get("debt_to_equity")
     if isinstance(de, (int, float)):
-        if de < 0.5:  add(S, f"Low leverage: D/E of {de:.2f}x means minimal debt burden (threshold: <0.5x).", "forensics")
+        if de < 0:
+            add(V, f"Negative book equity (D/E {de:.2f}x): decades of buybacks or losses have depleted equity — leverage cannot be judged by D/E here; check debt against cash flow instead.", "forensics")
+        elif de < 0.5:  add(S, f"Low leverage: D/E of {de:.2f}x means minimal debt burden (threshold: 0–0.5x).", "forensics")
         elif de > 2:  add(V, f"High leverage: D/E of {de:.2f}x exceeds the 2.0x risk threshold.", "forensics")
 
     gm = m.get("gross_margin")
@@ -560,6 +562,29 @@ SEED_UNIVERSE = [
     "NOW","ISRG","AMAT","BKNG","VZ","T","LOW","NKE","UNP","PFE",
 ]
 
+# Static sector map for the seed universe (zero API cost). Drives the
+# financials exclusion (banks/insurers have structurally incomparable FCF and
+# margins — CFA review July 2026) and the concentration warning.
+SECTOR = {
+ "AAPL":"Technology","MSFT":"Technology","GOOGL":"Technology","AMZN":"Consumer","NVDA":"Technology",
+ "META":"Technology","TSLA":"Consumer","AVGO":"Technology","BRK-B":"Financials","JPM":"Financials",
+ "V":"Financials-Networks","MA":"Financials-Networks","UNH":"Healthcare","JNJ":"Healthcare","XOM":"Energy",
+ "PG":"Consumer Staples","HD":"Consumer","COST":"Consumer Staples","ABBV":"Healthcare","WMT":"Consumer Staples",
+ "KO":"Consumer Staples","PEP":"Consumer Staples","MRK":"Healthcare","ORCL":"Technology","CRM":"Technology",
+ "AMD":"Technology","NFLX":"Communication","ADBE":"Technology","TMO":"Healthcare","MCD":"Consumer",
+ "CSCO":"Technology","ACN":"Technology","LIN":"Materials","ABT":"Healthcare","INTU":"Technology",
+ "TXN":"Technology","QCOM":"Technology","IBM":"Technology","GE":"Industrials","CAT":"Industrials",
+ "NOW":"Technology","ISRG":"Healthcare","AMAT":"Technology","BKNG":"Consumer","VZ":"Communication",
+ "T":"Communication","LOW":"Consumer","NKE":"Consumer","UNP":"Industrials","PFE":"Healthcare",
+}
+# True financials (banks/insurers): FCF, operating margin, and D/E-style
+# leverage metrics do not apply. Payment NETWORKS (V/MA) are asset-light
+# processors, not balance-sheet lenders — their FCF is economically real,
+# so they stay in. A sector-appropriate "Bank Fortress" lens (ROA, CET1,
+# NIM) is a named roadmap item, not built.
+FINANCIALS_EXCLUDE = {"JPM", "BRK-B"}
+
+
 def _v(r, key):
     v = r.get(key)
     try:
@@ -571,41 +596,62 @@ def _pct(r, key):
     v = _v(r, key)
     return round(v * 100, 2) if v is not None else None
 
+
+def _leverage_ok(r, de_max, nde_max):
+    """CFA fix (July 2026 review): decades of buybacks push book equity
+    negative (MCD D/E ~ -43x), so a bare 'D/E < x' test flags the MOST
+    leveraged names as least leveraged. Order of preference:
+      1. Net Debt / EBITDA if the vendor provides it (capital-structure
+         neutral — the gold-standard leverage metric).
+      2. Otherwise D/E, REQUIRING 0 <= D/E < threshold (negative = fail:
+         leverage is unmeasurable via equity, not 'low')."""
+    nde = _v(r, "netDebtToEBITDATTM")
+    if nde is not None:
+        return nde < nde_max
+    de = _v(r, "debtToEquityRatioTTM")
+    return de is not None and 0 <= de < de_max
+
+
 THEMES = [
     {"id": "fortress", "name": "Buffett Fortresses",
      "desc": "Ultra-low leverage, wide margins, high returns on capital.",
      "filter": lambda r: (
-         (_v(r, "debtToEquityRatioTTM") or 99) < 0.5 and
-         (_pct(r, "grossProfitMarginTTM") or 0) > 40 and
+         r.get("symbol") not in FINANCIALS_EXCLUDE and
+         _leverage_ok(r, 0.5, 1.5) and
+         40 < (_pct(r, "grossProfitMarginTTM") or 0) <= 98 and
          (_pct(r, "_roic") or 0) > 15),
-     "criteria": "D/E < 0.5x AND Gross Margin > 40% AND ROIC > 15%"},
+     "criteria": "NetDebt/EBITDA < 1.5x (or 0 \u2264 D/E < 0.5x) AND Gross Margin 40\u201398% AND ROIC > 15% \u00b7 banks/insurers excluded"},
     {"id": "cash_machines", "name": "Cash Machines",
      "desc": "Businesses generating outsized free cash flow relative to their market value.",
      "filter": lambda r: (
+         r.get("symbol") not in FINANCIALS_EXCLUDE and
          (_pct(r, "_fcf_yield") or 0) > 5 and
          (_pct(r, "operatingProfitMarginTTM") or 0) > 15),
-     "criteria": "FCF Yield > 5% AND Operating Margin > 15%"},
+     "criteria": "FCF Yield > 5% AND Operating Margin > 15% \u00b7 banks/insurers excluded (FCF not meaningful for lenders)"},
     {"id": "growth_quality", "name": "Quality Growth",
      "desc": "Fast growers that aren't sacrificing margins or balance sheet health.",
      "filter": lambda r: (
-         (_v(r, "_rev_growth") or 0) > 0.20 and
-         (_pct(r, "grossProfitMarginTTM") or 0) > 35 and
+         r.get("symbol") not in FINANCIALS_EXCLUDE and
+         (_v(r, "_rev_cagr3") if _v(r, "_rev_cagr3") is not None else (_v(r, "_rev_growth") or 0)) > 0.15 and
+         35 < (_pct(r, "grossProfitMarginTTM") or 0) <= 98 and
          0 < (_v(r, "priceToEarningsRatioTTM") or 0) < 40),
-     "criteria": "Revenue Growth > 20% AND Gross Margin > 35% AND P/E < 40x"},
+     "criteria": "3-Year Revenue CAGR > 15% AND Gross Margin 35\u201398% AND P/E < 40x \u00b7 multi-year smoothing avoids peak-earnings traps"},
     {"id": "dividend", "name": "Dividend Compounders",
      "desc": "Paying dividends while maintaining financial discipline.",
      "filter": lambda r: (
+         r.get("symbol") not in FINANCIALS_EXCLUDE and
          (_pct(r, "dividendYieldTTM") or 0) > 2 and
-         (_v(r, "debtToEquityRatioTTM") or 99) < 1.0 and
+         _leverage_ok(r, 1.0, 3.0) and
          (_pct(r, "operatingProfitMarginTTM") or 0) > 10),
-     "criteria": "Dividend Yield > 2% AND D/E < 1.0x AND Operating Margin > 10%"},
+     "criteria": "Dividend Yield > 2% AND NetDebt/EBITDA < 3.0x (or 0 \u2264 D/E < 1.0x) AND Operating Margin > 10% \u00b7 banks/insurers excluded"},
     {"id": "undervalued", "name": "Undervalued Quality",
      "desc": "Cheap on earnings with solid margins and cash generation.",
      "filter": lambda r: (
+         r.get("symbol") not in FINANCIALS_EXCLUDE and
          0 < (_v(r, "priceToEarningsRatioTTM") or 0) < 15 and
-         (_pct(r, "grossProfitMarginTTM") or 0) > 30 and
+         30 < (_pct(r, "grossProfitMarginTTM") or 0) <= 98 and
          (_pct(r, "_fcf_yield") or 0) > 3),
-     "criteria": "P/E < 15x AND Gross Margin > 30% AND FCF Yield > 3%"},
+     "criteria": "P/E < 15x AND Gross Margin 30\u201398% AND FCF Yield > 3% \u00b7 banks/insurers excluded"},
 ]
 
 
@@ -629,12 +675,17 @@ def _fetch_screen_rows(main) -> list[dict]:
             if isinstance(km, list) and km:
                 row["_fcf_yield"] = km[0].get("freeCashFlowYieldTTM")
                 row["_roic"]      = km[0].get("returnOnInvestedCapitalTTM")
-            inc = main._fmp_get(f"income-statement?symbol={sym}&limit=2&period=annual")
+            inc = main._fmp_get(f"income-statement?symbol={sym}&limit=4&period=annual")
             if isinstance(inc, list) and len(inc) >= 2:
                 r_new = inc[0].get("revenue") or 0
                 r_old = inc[1].get("revenue") or 0
                 if r_old:
                     row["_rev_growth"] = (r_new - r_old) / abs(r_old)
+                # 3y CAGR (peak-earnings smoothing) when 4 fiscal years exist
+                if len(inc) >= 4:
+                    r3 = inc[3].get("revenue") or 0
+                    if r3 > 0 and r_new > 0:
+                        row["_rev_cagr3"] = (r_new / r3) ** (1/3) - 1
             return row
         except Exception:
             return None
@@ -686,10 +737,23 @@ def api_screens(request: Request):
             except Exception:
                 continue
         passing.sort(key=lambda x: (-(x.get("gm") or 0), (x.get("pe") or 99)))
+        top15 = passing[:15]
+        # CFP suitability: warn on sector over-concentration (>35% one sector)
+        conc = None
+        if len(top15) >= 3:
+            counts = {}
+            for s in top15:
+                sec = SECTOR.get(s["ticker"], "Other")
+                counts[sec] = counts.get(sec, 0) + 1
+            top_sec, top_n = max(counts.items(), key=lambda kv: kv[1])
+            share = round(top_n / len(top15) * 100)
+            if share > 35:
+                conc = (f"{share}% {top_sec} \u2014 this lens is sector-concentrated. "
+                        f"For a diversified portfolio, pair these with holdings from other sectors.")
         results.append({
             "id": th["id"], "name": th["name"], "desc": th["desc"],
-            "criteria": th["criteria"], "count": len(passing[:15]),
-            "stocks": passing[:15],
+            "criteria": th["criteria"], "count": len(top15),
+            "stocks": top15, "concentration_warning": conc,
             "performance": None,  # fetched lazily per theme
         })
 

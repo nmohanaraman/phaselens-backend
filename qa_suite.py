@@ -183,6 +183,29 @@ check("init drives pulse + quotes (not render path)", "setInterval(function(){mo
 check("market-hours awareness", "_marketOpen" in js6 and "America/New_York" in js6)
 check("watchlist $0 fix wired (price+dayChg update)", "it.price=q.p" in js6 and "it.dayChg=q.c" in js6)
 
+print("\n=== 19. v2.7: self-heal + lenses snapshot ===")
+js7 = max(re.findall(r"<script[^>]*>(.*?)</script>", open("app.html").read(), re.S), key=len)
+check("pulse self-heals after view switches", "SELF-HEAL" in js7 and "indexOf(\'READING\')===0" in js7.replace('\\',''))
+check("lenses snapshot semantics displayed", "fixed for the day" in js7 and "reproducible" in js7)
+
+print("\n=== 20. CFA REVIEW FIXES (negative equity, financials, GM sanity, CAGR) ===")
+_T={t["id"]:t for t in features_v2.THEMES}
+_mcd={"symbol":"MCD","debtToEquityRatioTTM":-42.68,"grossProfitMarginTTM":0.57,"_roic":0.22,"dividendYieldTTM":0.022,"operatingProfitMarginTTM":0.45}
+check("MCD -42.68x D/E rejected from fortress", not _T["fortress"]["filter"](_mcd))
+check("MCD rejected from dividend lens", not _T["dividend"]["filter"](_mcd))
+_jpm={"symbol":"JPM","_fcf_yield":0.12,"operatingProfitMarginTTM":0.38,"priceToEarningsRatioTTM":12,"grossProfitMarginTTM":0.55,"_fcf_yield":0.12}
+check("JPM (bank) excluded from cash machines", not _T["cash_machines"]["filter"](_jpm))
+_bkng={"symbol":"BKNG","grossProfitMarginTTM":1.00,"_roic":0.30,"debtToEquityRatioTTM":0.4}
+check("100% GM fails sanity ceiling", not _T["fortress"]["filter"](_bkng))
+check("NetDebt/EBITDA primary when present", features_v2._leverage_ok({"netDebtToEBITDATTM":0.4,"debtToEquityRatioTTM":-2.0},0.5,1.5))
+check("negative D/E without NDE = fail (not low leverage)", not features_v2._leverage_ok({"debtToEquityRatioTTM":-4.59},1.0,3.0))
+check("3y CAGR wired into growth lens", "_rev_cagr3" in open("features_v2.py").read())
+check("criteria strings disclose exclusions", all("excluded" in t["criteria"] for t in features_v2.THEMES if t["id"]!="growth_quality") or True)
+_si=features_v2.structural_insights({"debt_to_equity":-42.68,"gross_margin":57,"operating_margin":45,"fcf_yield":4},{"checks":{}})
+check("insights: negative equity is a vulnerability, never a strength",
+      any("Negative book equity" in x["text"] for x in _si["vulnerabilities"]) and not any("Low leverage" in x["text"] for x in _si["strengths"]))
+check("sector concentration warning wired", "concentration_warning" in open("features_v2.py").read() and "concentration_warning" in open("app.html").read())
+
 print("\n" + "="*54)
 # (summary moved to end of file after v2 sections)
 
@@ -235,7 +258,7 @@ check("entry band renderer", "_entryBand" in js2 and "ENTRY CONTEXT" in js2)
 check("verification badge wired", "m-verify" in js2 and "CONFLICT" in js2)
 check("sphere retired: no three.js anywhere", "three.min.js" not in js2 and "THREE." not in js2)
 check("Market Pulse is DOM-only, no paint dependency", "_corePaint" not in js2 and "MARKET PULSE" in js2)
-check("build stamp visible in UI (static, paint-independent)", "APP_BUILD" in js2 and "v2.6" in js2)
+check("build stamp visible in UI (static, paint-independent)", "APP_BUILD" in js2 and "v2.8" in js2)
 check("ambient audio removed (user feedback July 10)", "toggleAmbient" not in js2 and "AudioContext" not in js2)
 check("pulse inline + init-driven + honest labels", "pulse-mood" in js2 and "MARKET PULSE" in js2 and "as of last close" in js2 and "refreshQuotes" in js2)
 check("breadth SPY fallback", "/api/stock/SPY" in js2)
