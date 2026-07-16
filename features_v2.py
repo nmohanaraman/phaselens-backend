@@ -113,6 +113,8 @@ def peer_comparison(t: str, m: dict) -> dict | None:
         tv, mv = m.get(f), medians.get(f)
         if not isinstance(tv, (int, float)) or not isinstance(mv, (int, float)):
             stance[f] = "na"
+        elif f == "debt_to_equity" and (tv < 0 or mv < 0):
+            stance[f] = "na"   # negative book equity: D/E comparison is meaningless
         elif tv == mv:
             stance[f] = "inline"
         else:
