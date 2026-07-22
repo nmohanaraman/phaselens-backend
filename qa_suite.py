@@ -284,6 +284,29 @@ check("no invite code required to SIGN IN", "invite code is required to create a
 check("founder badge in app (dated)", "Founding Member" in _ap and "free until" in _ap)
 check("no fake prices / fake discounts anywhere", "was $" not in _ix.lower() and "% off" not in _ix.lower() and "limited time" not in _ix.lower())
 
+print("\n=== 27. FIREBASE SDK RESILIENCE ===")
+_ix3=open("index.html").read()
+check("initFB no-ops when SDK absent (no ReferenceError)", "typeof firebase===\'undefined\'" in _ix3.replace('"',"'"))
+check("whenFB poller waits for SDK (~6s)", "whenFB" in _ix3 and "tries" in _ix3)
+check("magic-return boots through the poller", "whenFB(handleMagicReturn)" in _ix3)
+check("single honest warning when SDK never loads", "gstatic" in _ix3)
+
+print("\n=== 28. AUTH ERROR VISIBILITY (email-exists bug) ===")
+_ix4=open("index.html").read()
+_cs=_ix4[_ix4.index("}catch(err){"):_ix4.index("}catch(err){")+1600]
+check("catch rebuilds UI BEFORE showing error (sw wipes eb)", _cs.index("sw(mode)") < _cs.index("showErr(m[err.code]"))
+check("_holdRedirect released on auth failure", "_holdRedirect=false;   // failed signup" in _ix4)
+check("email-exists message is actionable", "already exists" in _ix4 and "switch to Sign In" in _ix4)
+
+print("\n=== 29. AUTH FLOW HARNESS (DOM-level, mocked Firebase) ===")
+import subprocess as _sp, shutil as _sh
+if _sh.which("node") and os.path.exists("test_auth_flows.js") and os.path.exists("/home/claude/authtest/node_modules/jsdom"):
+    _r = _sp.run(["node","test_auth_flows.js"],capture_output=True,text=True,cwd=".")
+    _last = (_r.stdout.strip().splitlines() or ["?"])[-1]
+    check("all DOM auth flows pass (" + _last + ")", _r.returncode == 0, _r.stdout[-400:] if _r.returncode else "")
+else:
+    print("  [SKIP] node/jsdom not present in this environment — run: node test_auth_flows.js")
+
 print("\n" + "="*54)
 # (summary moved to end of file after v2 sections)
 
