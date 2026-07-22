@@ -15,6 +15,7 @@ Design constraints honored (Requirements v2):
 from __future__ import annotations
 
 import json
+import os
 import time
 import logging
 import concurrent.futures as _fut
@@ -955,3 +956,28 @@ def api_quotes(symbols: str, request: Request, debug: bool = False):
         payload["_raw"] = raw   # unprocessed FMP response — diagnostic only
     _QUOTES_CACHE[key] = (time.time() + 600, payload)
     return payload
+
+
+# ═══════════ PRIVATE BETA ACCESS CODES (honest gate, not a fake paywall) ═══
+# Codes live in env ACCESS_CODES (comma-separated; per-channel codes let you
+# see which distribution source converts). Everything shown to the user is
+# TRUE: it IS invite-only, founders DO get 12 months free, planned pricing IS
+# planned. Client-side entitlement gates the door; API-level enforcement is
+# the Supabase milestone (with forward-tracking + passkeys).
+_DEFAULT_CODES = "FOUNDER2026"
+FOUNDER_MONTHS = 12
+
+@router.get("/api/access/validate")
+def api_access_validate(code: str, request: Request):
+    import main
+    main._rate_limit(f"access:{main._client_ip(request)}")   # brute-force brake
+    codes = {c.strip().upper() for c in
+             (os.getenv("ACCESS_CODES") or _DEFAULT_CODES).split(",") if c.strip()}
+    entered = (code or "").strip().upper()
+    if not entered or entered not in codes:
+        log.info("access code rejected: %s", entered[:20])
+        return {"valid": False}
+    expires = time.strftime("%Y-%m-%d", time.gmtime(time.time() + FOUNDER_MONTHS * 30.44 * 86400))
+    log.info("access code accepted: %s", entered)
+    return {"valid": True, "plan": "founder", "label": "Founding Member",
+            "months_free": FOUNDER_MONTHS, "expires": expires, "code": entered}
