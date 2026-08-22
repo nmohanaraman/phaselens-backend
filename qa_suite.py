@@ -307,6 +307,89 @@ if _sh.which("node") and os.path.exists("test_auth_flows.js") and os.path.exists
 else:
     print("  [SKIP] node/jsdom not present in this environment — run: node test_auth_flows.js")
 
+print("\n=== 30. PORTFOLIO PRIVACY (cross-account leak fix) ===")
+_a5=open("app.html").read()
+check("cross-key scan REMOVED", "recovered " not in _a5 and "alternate storage key" not in _a5)
+check("recovery limited to anon key only", "phaselens_v1_anon" in _a5 and "Cross-account reads are" in _a5)
+check("anon key deleted after one-shot migration", "removeItem(\'phaselens_v1_anon\')" in _a5.replace('"',"'"))
+check("seed trimmed to AAPL+META", _a5.count("SEED_PORT = [")==1 and "PLTR" not in _a5.split("SEED_PORT")[1][:900] and "META" in _a5.split("SEED_PORT")[1][:600])
+check("no personal cost basis in seeds (11sh / QBTS-class watch)", "shares:11" not in _a5 and "QBTS" not in _a5.split("SEED_WATCH")[1][:400])
+
+print("\n=== 31. LEGAL PAGES (terms + privacy) ===")
+_t=open("terms.html").read(); _p=open("privacy.html").read(); _ix6=open("index.html").read()
+check("terms page exists with liability anchor", 'id="liability"' in _t and "Limitation of Liability" in _t)
+check("not-financial-advice + no-fiduciary clauses", "not a registered investment adviser" in _t and "educational" in _t.lower())
+check("backtest/survivorship disclosed in terms", "survivorship" in _t and "Hypothetical" in _t)
+check("liability cap present", "US $50" in _t or "fifty U.S. dollars" in _t)
+check("privacy: portfolio stays in browser stated", "localStorage" in _p and "never transmitted" in _p)
+check("privacy: third parties named honestly", all(x in _p for x in ("Firebase","Financial Modeling Prep","Groq")))
+check("signup links point at real .html files", "/terms.html" in _ix6 and "/privacy.html" in _ix6 and 'href="/terms"' not in _ix6)
+check("liability link deep-anchors", "/terms.html#liability" in _ix6)
+
+print("\n=== 32. TERMS: SECURITIES COMPLIANCE + FEDERAL LAW ===")
+_t2=open("terms.html").read()
+check("public-information-only representation", "only publicly available information" in _t2 and "MNPI" in _t2)
+check("insider-trading prohibition on users (10b-5 cited)", "Rule 10b-5" in _t2 and "Securities Exchange Act" in _t2)
+check("blackout/restricted-list responsibility named", "blackout period" in _t2)
+check("federal law in governing-law clause", "federal laws of the United States" in _t2 and "federal securities laws" in _t2)
+check("liability anchor survived renumbering", 'id="liability">6. Limitation of Liability' in _t2)
+
+print("\n=== 33. PRIVACY HARDENING + DISPUTE RESOLUTION ===")
+_p3=open("privacy.html").read(); _t3=open("terms.html").read()
+check("TRUTH: usage-data identified (not anonymized) + tickers disclosed", "identified, not anonymous" in _p3 and "tickers you analyze" in _p3)
+check("portfolio shield precise (ticker-event nuance) + future-proofed", "cannot access, disclose, or produce" in _p3 and "ticker symbol of a stock" in _p3 and "before it takes effect" in _p3)
+check("legal-disclosure reservation present", "subpoena" in _p3)
+check("business-transfer clause present", "merger, acquisition" in _p3)
+check("US-processing scope (no GDPR overclaim)", "not directed to residents of the EEA" in _p3 and "GDPR" not in _p3)
+check("breach notice pegged to law (no overpromise)", "as required by applicable law" in _p3)
+check("state-rights contact path (no statutory overclaim)", "state privacy laws" in _p3 and "CCPA" not in _p3)
+check("terms: arbitration + class waiver + opt-out", "binding individual arbitration" in _t3 and "class action" in _t3 and "opt out" in _t3)
+check("governing law renumbered intact", "12. Governing Law" in _t3)
+
+print("\n=== 34. FIREBASE SDK CDN FALLBACK ===")
+_ix7=open("index.html").read()
+check("gstatic primary + cdnjs fallback chain", "gstatic.com/firebasejs" in _ix7 and "cdnjs.cloudflare.com/ajax/libs/firebase" in _ix7)
+check("sequential load (auth after app)", "firebase-app-compat.js" in _ix7 and _ix7.index("firebase-app-compat.js") < _ix7.index("firebase-auth-compat.js"))
+check("whenFB patience extended for fallback", "tries=48" in _ix7)
+
+print("\n=== 35. UX REVIEW FIXES (verify/fix/reject round) ===")
+_a8=open("app.html").read(); _ix8=open("index.html").read()
+check("analyze failure speaks (no silent stale data)", "Could not load live analysis" in _a8)
+check("signup consent bridges to app (no double terms modal)", "pl_terms_v1" in _ix8)
+check("one-time welcome hint (dismissible by design)", "pl_welcomed" in _a8)
+check("keyboard focus visibility styles", "focus-visible" in _a8)
+check("lens loading state: spinner + expectation set", "plspin" in _a8 and "~15s" in _a8)
+check("REJECTED claim stays rejected: no i-icons were added to lenses", "info-icon" not in _a8)
+
+print("\n=== 36. METHODOLOGY PAGE (Reddit-ready) ===")
+_hw=open("how-it-works.html").read()
+check("thresholds match code: BUY>=70 / growth>15% / mature bar", "BUY &ge; 70" in _hw and "15%" in _hw and "1.5%" in _hw)
+check("AI role honestly scoped (narrative only, no predictions)", "never the decision-maker" in _hw)
+check("limitations section present incl survivorship", "survivorship" in _hw.lower() and "Known Limitations" in _hw)
+check("CFA fixes disclosed (NetDebt/EBITDA, financials exclusion, 3y CAGR)", "Net" in _hw and "EBITDA" in _hw and "3-year revenue CAGR" in _hw)
+check("linked from landing + persistent app nav", "how-it-works.html" in open("index.html").read() and open("app.html").read().count("how-it-works.html") >= 2)
+
+print("\n=== 37. SUPPORT EMAIL CONSISTENCY ===")
+_docs={f:open(f).read() for f in ("how-it-works.html","privacy.html","terms.html")}
+check("support address on all three public docs", all("phaselensai@gmail.com" in d for d in _docs.values()))
+check("personal email absent from public pages", all("nmohanaraman@gmail.com" not in d for d in _docs.values()))
+check("arbitration opt-out has concrete destination", "phaselensai@gmail.com" in _docs["terms.html"].split("opt out")[1][:300])
+
+print("\n=== 38. DEBATE ERROR TRANSPARENCY ===")
+_fv2=open("features_v2.py").read()
+check("analysis-stage HTTPException re-raised (rate limit surfaces)", "except HTTPException:\n            raise" in _fv2)
+check("analysis failure gets its own message (not Groq-blamed)", "Debate needs a completed analysis first" in _fv2)
+# behavioral: with a key set and analysis raising 429, debate must surface 429
+_old_key, _old_an = main.GROQ_API_KEY, main.api_analyze
+main.GROQ_API_KEY = "test-key"
+from fastapi import HTTPException as _HE
+def _boom(t, req): raise _HE(429, "Rate limit: too many analyses. Try again in a few minutes.")
+main.api_analyze = _boom
+main._rl_buckets.clear(); features_v2._DEBATE_CACHE.clear(); main._analysis_cache.clear()
+_r = client.get("/api/debate/TSLA")
+check("429 from analysis reaches the caller (not masked as 503)", _r.status_code == 429 and "Rate limit" in _r.json().get("detail",""))
+main.GROQ_API_KEY, main.api_analyze = _old_key, _old_an
+
 print("\n" + "="*54)
 # (summary moved to end of file after v2 sections)
 
@@ -359,7 +442,7 @@ check("entry band renderer", "_entryBand" in js2 and "ENTRY CONTEXT" in js2)
 check("verification badge wired", "m-verify" in js2 and "CONFLICT" in js2)
 check("sphere retired: no three.js anywhere", "three.min.js" not in js2 and "THREE." not in js2)
 check("Market Pulse is DOM-only, no paint dependency", "_corePaint" not in js2 and "MARKET PULSE" in js2)
-check("build stamp visible in UI (static, paint-independent)", "APP_BUILD" in js2 and "v3.2" in js2)
+check("build stamp visible in UI (static, paint-independent)", "APP_BUILD" in js2 and "v3.5" in js2)
 check("ambient audio removed (user feedback July 10)", "toggleAmbient" not in js2 and "AudioContext" not in js2)
 check("pulse inline + init-driven + honest labels", "pulse-mood" in js2 and "MARKET PULSE" in js2 and "as of last close" in js2 and "refreshQuotes" in js2)
 check("breadth SPY fallback", "/api/stock/SPY" in js2)

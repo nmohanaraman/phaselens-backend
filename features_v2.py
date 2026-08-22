@@ -218,9 +218,21 @@ def api_debate(ticker: str, request: Request, rounds: int = 2):
         return hit[1]
     if not main.GROQ_API_KEY:
         raise HTTPException(503, "Debate Mode requires the AI narrative engine, which is not configured.")
-    # Reuse the cached analysis; run one if absent (counts against rate limit naturally).
+    # Reuse the cached analysis; run one if absent. IMPORTANT: analysis-stage
+    # failures (our own rate limit, FMP errors) must surface with their REAL
+    # message — previously they were swallowed into the generic "Debate
+    # unavailable", making the user's own 429 look like a Groq outage.
     cached = main._analysis_cache.get(t)
-    analysis = cached[1] if cached and cached[0] > time.time() else main.api_analyze(t, request)
+    if cached and cached[0] > time.time():
+        analysis = cached[1]
+    else:
+        try:
+            analysis = main.api_analyze(t, request)
+        except HTTPException:
+            raise                     # real cause (e.g. rate limit) reaches the user
+        except Exception as exc:
+            log.warning("debate(%s) analysis stage: %s", t, main._scrub_secrets(str(exc)))
+            raise HTTPException(503, "Debate needs a completed analysis first — analyze the ticker, then retry.")
     ctx = json.dumps({
         "score": analysis.get("score"), "recommendation": analysis.get("recommendation"),
         "phase": analysis.get("phase"), "metrics": analysis.get("metrics"),
