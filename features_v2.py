@@ -250,15 +250,29 @@ def api_debate(ticker: str, request: Request, rounds: int = 2):
                           f"\nCONTEXT:\n{ctx}")
                 r = httpx.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {main.GROQ_API_KEY}"},
-                    json={"model": "llama-3.1-8b-instant",
+                    json={"model": GROQ_MODEL,
                           "messages": [{"role": "user", "content": prompt}],
                           "temperature": 0.5, "max_tokens": 350}, timeout=30)
                 r.raise_for_status()
                 text = r.json()["choices"][0]["message"]["content"].strip()
                 transcript.append({"round": rnd, "side": side, "text": text})
                 history += f"\n[{side} R{rnd}] {text}"
+        _partial = False
     except Exception as exc:
-        log.warning("debate(%s): %s", t, main._scrub_secrets(str(exc)))
+        detail = main._scrub_secrets(str(exc))
+        log.warning("debate(%s): %s", t, detail)
+        low = detail.lower()
+        # Name the cause instead of a blanket "unavailable" — a decommissioned
+        # model looked identical to an outage and cost a full debug cycle.
+        if "decommission" in low or "does not exist" in low or "invalid_request" in low:
+            raise HTTPException(503, f"Debate Mode is offline: the AI provider retired the model '{GROQ_MODEL}'. "
+                                     "Set the GROQ_MODEL environment variable to a current model to restore it.")
+        if "401" in low or "unauthorized" in low or "invalid api key" in low:
+            raise HTTPException(503, "Debate Mode is offline: the AI provider rejected our credentials.")
+        if "429" in low or "rate limit" in low:
+            raise HTTPException(503, "Debate Mode is busy (AI provider rate limit). Try again in a minute.")
+        if "timeout" in low or "timed out" in low:
+            raise HTTPException(503, "Debate Mode timed out generating the exchange. Try again.")
         raise HTTPException(503, "Debate Mode is temporarily unavailable. Please try again shortly.")
     payload = {"ticker": t, "rounds": rounds, "transcript": transcript,
                "adjudicator": {"score": analysis.get("score"),
@@ -504,7 +518,7 @@ def api_radar(request: Request):
                 + tickers_ctx)
             r = _hx.post("https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {main.GROQ_API_KEY}"},
-                json={"model": "llama-3.1-8b-instant",
+                json={"model": GROQ_MODEL,
                       "messages": [{"role": "user", "content": prompt}],
                       "temperature": 0.3, "max_tokens": 250}, timeout=15)
             r.raise_for_status()
@@ -976,6 +990,12 @@ def api_quotes(symbols: str, request: Request, debug: bool = False):
 # TRUE: it IS invite-only, founders DO get 12 months free, planned pricing IS
 # planned. Client-side entitlement gates the door; API-level enforcement is
 # the Supabase milestone (with forward-tracking + passkeys).
+# Groq model. llama-3.1-8b-instant was deprecated 2026-06-17 and SHUT DOWN
+# 2026-08-16 (400 model_decommissioned) — which is exactly what broke Debate
+# Mode. Env-overridable so the next deprecation is a Render setting, not a
+# redeploy. Recommended successor per Groq's deprecation notice.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
 _DEFAULT_CODES = "FOUNDER2026"
 FOUNDER_MONTHS = 12
 

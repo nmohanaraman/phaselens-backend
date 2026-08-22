@@ -390,6 +390,14 @@ _r = client.get("/api/debate/TSLA")
 check("429 from analysis reaches the caller (not masked as 503)", _r.status_code == 429 and "Rate limit" in _r.json().get("detail",""))
 main.GROQ_API_KEY, main.api_analyze = _old_key, _old_an
 
+print("\n=== 39. GROQ MODEL MIGRATION (llama-3.1-8b shutdown 2026-08-16) ===")
+_fv3=open("features_v2.py").read(); _mn=open("main.py").read()
+check("no call site still requests the retired model", '"model": "llama-3.1-8b-instant"' not in _fv3 and '"model": "llama-3.1-8b-instant"' not in _mn)
+check("central GROQ_MODEL constant, env-overridable", "GROQ_MODEL = os.getenv" in _fv3 and "GROQ_MODEL" in _mn)
+check("default is the recommended successor", "openai/gpt-oss-20b" in _fv3 and "openai/gpt-oss-20b" in _mn)
+check("decommissioned model self-reports", "retired the model" in _fv3)
+check("auth / rate-limit / timeout causes distinguished", "rejected our credentials" in _fv3 and "rate limit" in _fv3 and "timed out generating" in _fv3)
+
 print("\n" + "="*54)
 # (summary moved to end of file after v2 sections)
 

@@ -24,6 +24,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+# See features_v2: llama-3.1-8b-instant shut down 2026-08-16. Env-overridable.
+GROQ_MODEL   = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 FMP_API_KEY         = os.environ.get("FMP_API_KEY", "")
 ADMIN_KEY           = os.environ.get("ADMIN_KEY", "")
 ADMIN_EMAIL         = os.environ.get("ADMIN_EMAIL", "nmohanaraman@gmail.com").strip().lower()
@@ -917,7 +919,7 @@ def groq_analysis(t, m, phase, sig, forensics=None):
     r = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={"model": "llama-3.1-8b-instant",
+        json={"model": GROQ_MODEL,
               "messages": [{"role": "user", "content": prompt}],
               "response_format": {"type": "json_object"}, "temperature": 0.3},
         timeout=30,
