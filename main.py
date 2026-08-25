@@ -194,10 +194,31 @@ def verify_firebase_token(token: str) -> dict:
             "name": claims.get("name") or "",
             "provider": fb.get("sign_in_provider", "password")}
 
-# ─────────────────────────── Market data (yfinance, cached) ─────────────────
+# ─────────────────────────── Market data (FMP, cached) ────────────────────
 _stock_cache: dict = {}
 _analysis_cache: dict = {}
 STOCK_TTL, ANALYSIS_TTL = 900, 21600
+
+# ── Cache bounding ────────────────────────────────────────────────────────
+# These dicts previously had TTLs but no eviction: an expired entry stayed
+# resident forever and every distinct ticker ever requested cost permanent
+# memory. On a 512 MB instance that is a slow leak. cache_put() enforces both
+# an expiry sweep and a hard entry cap (oldest-expiry-first eviction).
+_STOCK_MAX    = int(os.environ.get("STOCK_CACHE_MAX", "300"))
+_ANALYSIS_MAX = int(os.environ.get("ANALYSIS_CACHE_MAX", "150"))
+
+def cache_put(store: dict, key, value, ttl: float, max_entries: int) -> None:
+    """Insert with TTL, sweep expired entries, then cap size. Never raises."""
+    try:
+        now = time.time()
+        store[key] = (now + ttl, value)
+        for k in [k for k, v in list(store.items()) if v[0] <= now]:
+            store.pop(k, None)
+        if len(store) > max_entries:
+            for k, _ in sorted(store.items(), key=lambda kv: kv[1][0])[: len(store) - max_entries]:
+                store.pop(k, None)
+    except Exception:
+        pass
 
 MOCK_DATA = {
     "ticker": "MOCK", "name": "Mock Co", "price": 100.0, "pe_ratio": 25.0,
@@ -355,34 +376,17 @@ def fetch_stock(ticker: str) -> dict:
                 "fetch_stock(%s) failed: %s", t, _scrub_secrets(str(exc)))
             raise HTTPException(503, f"Market data temporarily unavailable for {t}. Please try again shortly.")
     else:
-        # ── yfinance fallback (works locally, unreliable on cloud) ──
-        try:
-            import yfinance as yf
-            info = yf.Ticker(t).info
-            mc     = info.get("marketCap") or 0
-            fcf    = info.get("freeCashflow") or 0
-            de_raw = info.get("debtToEquity")
-            price  = info.get("currentPrice") or info.get("regularMarketPrice")
-            if not price:
-                raise ValueError("no price returned")
-            data = {
-                "ticker": t,
-                "name":             info.get("longName") or info.get("shortName") or t,
-                "price":            price,
-                "pe_ratio":         info.get("trailingPE"),
-                "fcf_yield":        round(fcf / mc * 100, 2) if mc else None,
-                "gross_margin":     round((info.get("grossMargins") or 0) * 100, 1),
-                "operating_margin": round((info.get("operatingMargins") or 0) * 100, 1),
-                "revenue_growth":   round((info.get("revenueGrowth") or 0) * 100, 1),
-                "dividend_yield":   round((info.get("dividendYield") or 0) * 100, 2),
-                "debt_to_equity":   round(de_raw / 100, 2) if de_raw else None,
-                "market_cap":       mc,
-            }
-        except Exception as exc:
-            logging.getLogger("uvicorn.error").warning(
-                "yfinance fallback(%s) failed: %s", t, _scrub_secrets(str(exc)))
-            raise HTTPException(503, f"Market data temporarily unavailable for {t}. Please try again shortly.")
-    _stock_cache[t] = (time.time() + STOCK_TTL, data)
+        # ── No FMP key configured ──
+        # This branch previously imported yfinance, which pulls pandas + numpy
+        # (~300 MB RSS) into the worker. On a 512 MB instance that single
+        # allocation OOM-kills the process. Production always has FMP_API_KEY
+        # set, so this path is dead there; we fail loudly rather than reaching
+        # for a dependency that can take the whole service down.
+        logging.getLogger("uvicorn.error").error(
+            "fetch_stock(%s): no FMP_API_KEY configured and no fallback provider", t)
+        raise HTTPException(503, f"Market data temporarily unavailable for {t}. Please try again shortly.")
+
+    cache_put(_stock_cache, t, data, STOCK_TTL, _STOCK_MAX)
     return data
 
 # ─────────────────────────── Deep data (balance sheet + cash flow) ─────────
@@ -1140,7 +1144,7 @@ def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str 
         "phase": ph["phase"], "phaseSignals": ph["signals"],
         "score": sig["score"], "recommendation": sig["recommendation"],
         "scoreRaw": sig.get("score_raw", sig["score"]),
-        "data_source": "fmp" if FMP_API_KEY else ("mock" if MOCK else "yfinance"),
+        "data_source": "fmp" if FMP_API_KEY else ("mock" if MOCK else "unavailable"),
         "signalDrivers": sig["drivers"], "metrics": m,
         "forensics": forensics.get("checks"),
         "verdictCard": verdict_card,
@@ -1152,7 +1156,7 @@ def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str 
         "complianceShield": COMPLIANCE_SHIELD,
         "generated_at": now_iso(),
     }
-    _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)
+    cache_put(_analysis_cache, t, payload, ANALYSIS_TTL, _ANALYSIS_MAX)
     # ── v2 enrichments (non-blocking; panels hide in UI when absent) ──
     try:
         import features_v2
@@ -1161,7 +1165,7 @@ def api_analyze(ticker: str, request: Request, visitor_id: str = "", email: str 
         payload["verification"]   = features_v2.verify_price(t, m.get("price"))
         payload["fairValue"]      = features_v2.fair_value(t, m, deep)
         payload["structuralInsights"] = features_v2.structural_insights(m, forensics)
-        _analysis_cache[t] = (time.time() + ANALYSIS_TTL, payload)  # recache enriched
+        cache_put(_analysis_cache, t, payload, ANALYSIS_TTL, _ANALYSIS_MAX)  # recache enriched
     except Exception as _v2exc:
         logging.getLogger("uvicorn.error").warning("v2 enrichment(%s): %s", t, _scrub_secrets(str(_v2exc)))
     # Auto-log verdict to analyses table for admin dashboard

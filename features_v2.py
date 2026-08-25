@@ -3,14 +3,14 @@ PhaseLens v2 features — Peer Comparison, Entry Context (valuation percentile),
 Verification Membrane (dual-source), and Debate Mode.
 
 Design constraints honored (Requirements v2):
-  * FREE-TIER ONLY: FMP free endpoints + yfinance best-effort + Groq.
+  * FREE-TIER ONLY: FMP free endpoints + Yahoo chart JSON best-effort + Groq.
   * NON-BLOCKING: every enrichment is wrapped so a failure can never break
     /api/analyze — panels simply hide in the UI when data is absent.
   * INDIA-READY: all fetchers take exchange="US" (only supported value today);
     an India provider later implements the same signatures.
   * BUDGET-AWARE: results ride the existing 6h analysis cache; peers add at
     most ~4 FMP calls per UNCACHED analysis; entry context adds 1;
-    verification adds 0 FMP calls (yfinance side, 2s time-boxed).
+    verification adds 0 FMP calls (Yahoo side, 2s time-boxed).
 """
 from __future__ import annotations
 
@@ -24,6 +24,12 @@ from fastapi import APIRouter, HTTPException, Request
 
 log = logging.getLogger("uvicorn.error")
 router = APIRouter()
+
+def _cput(store: dict, key, value, ttl: float, max_entries: int) -> None:
+    """Bounded cache write — delegates to main.cache_put (expiry sweep + size cap)."""
+    import main as _m
+    _m.cache_put(store, key, value, ttl, max_entries)
+
 
 _PEER_CACHE: dict = {}          # industry -> (expiry, [tickers])
 _PEER_TTL = 24 * 3600
@@ -58,7 +64,7 @@ def resolve_peers(t: str, n: int = 3, exchange: str = "US") -> list[str]:
             f"company-screener?industry={industry.replace(' ', '%20')}"
             f"&exchange=NASDAQ,NYSE&limit=10&sortBy=marketCap&order=desc")
         peers = [r.get("symbol") for r in scr if r.get("symbol")] if isinstance(scr, list) else []
-        _PEER_CACHE[industry] = (time.time() + _PEER_TTL, peers)
+        _cput(_PEER_CACHE, industry, peers, _PEER_TTL, 200)
         return [p for p in peers if p != t][:n]
     except Exception as exc:
         log.info("resolve_peers(%s): %s", t, main._scrub_secrets(str(exc)))
@@ -172,28 +178,51 @@ def entry_context(t: str, m: dict) -> dict | None:
 
 # ───────────────── Phase 2: verification membrane (dual-source) ────────────
 def verify_price(t: str, fmp_price) -> dict:
-    """Best-effort yfinance cross-check, hard 2s box. Never raises."""
+    """Best-effort second-source price cross-check, hard 2s box. Never raises.
+
+    MEMORY NOTE: this used to call yfinance, whose import pulls pandas + numpy
+    (~300 MB RSS) into the worker on the FIRST /api/analyze request. On a 512 MB
+    instance that single allocation OOM-killed the process (Render instance
+    ns5x4, 2026-08-25 05:18 UTC), returning 502s to clients. We now hit Yahoo's
+    public chart JSON endpoint directly with httpx — same data, no dataframes,
+    no import cost. Any failure degrades to SINGLE_SOURCE, which is an expected,
+    honest state the client already renders.
+    """
     import main
     result = {"primary": "fmp", "secondary": None, "status": "SINGLE_SOURCE", "divergence_pct": None}
     if main.MOCK or not isinstance(fmp_price, (int, float)) or fmp_price <= 0:
         return result
-
-    def _yf():
-        import yfinance as yf
-        fi = yf.Ticker(t).fast_info
-        return float(fi["last_price"] if "last_price" in dir(fi) or hasattr(fi, "__getitem__") else fi.last_price)
+    if os.getenv("DISABLE_PRICE_VERIFY", "").lower() in ("1", "true", "yes"):
+        return result
 
     try:
-        with _fut.ThreadPoolExecutor(max_workers=1) as ex:
-            alt = ex.submit(_yf).result(timeout=2.0)
+        alt = _second_source_price(t)
         if alt and alt > 0:
             div = abs(alt - fmp_price) / fmp_price * 100
-            result.update(secondary="yfinance", divergence_pct=round(div, 2),
+            result.update(secondary="yahoo", divergence_pct=round(div, 2),
                           status="VERIFIED" if div <= 1.5 else "CONFLICT",
                           secondary_price=round(alt, 2))
-    except Exception:
-        pass   # stays SINGLE_SOURCE — amber, honest
+    except Exception as exc:
+        log.info("verify_price(%s) degraded to SINGLE_SOURCE: %s", t, main._scrub_secrets(str(exc)))
     return result
+
+
+_YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{t}"
+_YF_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+
+def _second_source_price(t: str):
+    """Single lightweight HTTP GET. Returns float or None. Hard 2s timeout."""
+    import httpx
+    with httpx.Client(timeout=2.0, follow_redirects=True) as c:
+        r = c.get(_YF_CHART.format(t=t), params={"range": "1d", "interval": "1d"},
+                  headers=_YF_HEADERS)
+        if r.status_code != 200:
+            return None
+        meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+    px = meta.get("regularMarketPrice") or meta.get("previousClose")
+    return float(px) if isinstance(px, (int, float)) and px > 0 else None
 
 
 # ─────────────────────────── Phase 3b: Debate Mode ──────────────────────────
@@ -279,7 +308,7 @@ def api_debate(ticker: str, request: Request, rounds: int = 2):
                                "recommendation": analysis.get("recommendation"),
                                "note": "The deterministic scorecard is the adjudicator — both personas argued the same audited data."},
                "disclaimer": analysis.get("disclaimer")}
-    _DEBATE_CACHE[t] = (time.time() + _DEBATE_TTL, payload)
+    _cput(_DEBATE_CACHE, t, payload, _DEBATE_TTL, 100)
     return payload
 
 
@@ -930,7 +959,7 @@ def api_quotes(symbols: str, request: Request, debug: bool = False):
     if main.MOCK:
         payload = {"quotes": [{"symbol": s, "price": 100.0 + i, "day_change_pct": (-1) ** i * 1.2}
                               for i, s in enumerate(syms)]}
-        _QUOTES_CACHE[key] = (time.time() + 600, payload)
+        _cput(_QUOTES_CACHE, key, payload, 600, 200)
         return payload
 
     def _chg(r):
@@ -980,7 +1009,7 @@ def api_quotes(symbols: str, request: Request, debug: bool = False):
     payload = {"quotes": quotes}
     if debug:
         payload["_raw"] = raw   # unprocessed FMP response — diagnostic only
-    _QUOTES_CACHE[key] = (time.time() + 600, payload)
+    _cput(_QUOTES_CACHE, key, payload, 600, 200)
     return payload
 
 
