@@ -68,7 +68,6 @@ async def _security_headers(request, call_next):
     resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
-    maybe_trim()   # release free glibc arenas so RSS does not ratchet up
     return resp
 
 # ─────────────────────────── Database ───────────────────────────────────────
@@ -158,7 +157,7 @@ def _get_google_certs() -> dict:
     """Fetch + cache Google's public signing certs (rotated regularly)."""
     if _cert_cache["exp"] > time.time():
         return _cert_cache["certs"]
-    r = httpx.get(GOOGLE_CERT_URL, timeout=10)
+    r = HTTP.get(GOOGLE_CERT_URL, timeout=10)
     r.raise_for_status()
     _cert_cache["certs"] = r.json()
     _cert_cache["exp"] = time.time() + 3600
@@ -196,6 +195,20 @@ def verify_firebase_token(token: str) -> dict:
             "provider": fb.get("sign_in_provider", "password")}
 
 # ─────────────────────────── Market data (FMP, cached) ────────────────────
+# ── Shared HTTP client ────────────────────────────────────────────────────
+# MEASURED 2026-08-25 on the live instance: httpx.get()/httpx.post() build a
+# NEW Client — and a new TLS context with its own OpenSSL cert store — for
+# every call. That memory is allocated in C, is invisible to tracemalloc, and
+# malloc_trim(0) will not reclaim it. 20 module-level httpx.get() calls to one
+# HTTPS host retained 20 MB (1.0 MB each); the same 20 calls through a single
+# reused Client retained 1 MB total (0.05 MB each) — 20x less.
+#
+# /api/analyze makes 5-9 outbound calls, which is the ~9.5 MB per uncached
+# ticker that walked RSS from 73 MB to 358 MB over 30 tickers and OOM-killed
+# the 512 MB instance. Reusing one client also skips a TLS handshake per call.
+HTTP = httpx.Client(timeout=15, follow_redirects=True,
+                    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
+
 _stock_cache: dict = {}
 _analysis_cache: dict = {}
 STOCK_TTL, ANALYSIS_TTL = 900, 21600
@@ -207,37 +220,6 @@ STOCK_TTL, ANALYSIS_TTL = 900, 21600
 # an expiry sweep and a hard entry cap (oldest-expiry-first eviction).
 _STOCK_MAX    = int(os.environ.get("STOCK_CACHE_MAX", "300"))
 _ANALYSIS_MAX = int(os.environ.get("ANALYSIS_CACHE_MAX", "150"))
-
-# ── Allocator trim ────────────────────────────────────────────────────────
-# An uncached /api/analyze builds and discards several MB of temporary Python
-# objects while parsing multi-year FMP JSON. glibc does not hand those arenas
-# back to the OS on free(), so RSS ratchets up ~10 MB per unique ticker and
-# never falls — measured 73 MB -> 218 MB over 15 tickers on 2026-08-25, which
-# reaches the 512 MB cap at roughly 45 tickers. Repeat (cached) requests add
-# nothing, confirming it is allocator retention, not the cache: the cached
-# payload is only ~8 KB. malloc_trim(0) releases the free arenas back.
-_TRIM_EVERY = int(os.environ.get("MALLOC_TRIM_EVERY", "5"))
-_req_counter = 0
-
-def _malloc_trim() -> None:
-    """Return free heap arenas to the OS. No-op off glibc. Never raises."""
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-
-
-def maybe_trim() -> None:
-    """Trim every _TRIM_EVERY requests. Cheap (single-digit ms)."""
-    global _req_counter
-    try:
-        _req_counter += 1
-        if _req_counter % _TRIM_EVERY == 0:
-            _malloc_trim()
-    except Exception:
-        pass
-
 
 def cache_put(store: dict, key, value, ttl: float, max_entries: int) -> None:
     """Insert with TTL, sweep expired entries, then cap size. Never raises."""
@@ -295,7 +277,7 @@ def _fmp_get(path: str) -> dict:
     exception — catch status errors explicitly and scrub before re-raising."""
     url = f"https://financialmodelingprep.com/stable/{path}&apikey={FMP_API_KEY}"
     try:
-        r = httpx.get(url, timeout=15)
+        r = HTTP.get(url)
     except Exception as exc:
         logging.getLogger("uvicorn.error").warning("FMP network error: %s", _scrub_secrets(str(exc)))
         raise HTTPException(503, "Market data temporarily unavailable. Please try again shortly.")
@@ -952,7 +934,7 @@ def groq_analysis(t, m, phase, sig, forensics=None):
         '"moatAssessment":{"liability":{"rating":str,"reasoning":str},"businessModel":{"rating":str,"reasoning":str},"physicalIntegration":{"rating":str,"reasoning":str},"dataGravity":{"rating":str,"reasoning":str}},'
         '"mgmtNote":str(1 sentence on capital allocation discipline)}'
     )
-    r = httpx.post(
+    r = HTTP.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
         json={"model": GROQ_MODEL,

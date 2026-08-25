@@ -214,13 +214,14 @@ _YF_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 
 def _second_source_price(t: str):
     """Single lightweight HTTP GET. Returns float or None. Hard 2s timeout."""
-    import httpx
-    with httpx.Client(timeout=2.0, follow_redirects=True) as c:
-        r = c.get(_YF_CHART.format(t=t), params={"range": "1d", "interval": "1d"},
-                  headers=_YF_HEADERS)
-        if r.status_code != 200:
-            return None
-        meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+    import main
+    # Reuse the process-wide client — a per-call httpx.Client leaks ~1 MB of
+    # C-allocated TLS state per request that malloc_trim cannot reclaim.
+    r = main.HTTP.get(_YF_CHART.format(t=t), params={"range": "1d", "interval": "1d"},
+                      headers=_YF_HEADERS, timeout=2.0)
+    if r.status_code != 200:
+        return None
+    meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
     px = meta.get("regularMarketPrice") or meta.get("previousClose")
     return float(px) if isinstance(px, (int, float)) and px > 0 else None
 
@@ -277,7 +278,7 @@ def api_debate(ticker: str, request: Request, rounds: int = 2):
                           f"\nROUND {rnd} of {rounds}." +
                           (f"\nOPPONENT SO FAR:\n{history[-2000:]}" if history else "") +
                           f"\nCONTEXT:\n{ctx}")
-                r = httpx.post("https://api.groq.com/openai/v1/chat/completions",
+                r = main.HTTP.post("https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {main.GROQ_API_KEY}"},
                     json={"model": GROQ_MODEL,
                           "messages": [{"role": "user", "content": prompt}],
